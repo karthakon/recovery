@@ -1,0 +1,23 @@
+{
+  "name": "recovery",
+  "author": "karthakon",
+  "version": "1.0.0",
+  "keywords": ["pebble-app"],
+  "private": true,
+  "dependencies": {},
+  "pebble": {
+    "displayName": "Recovery",
+    "uuid": "020d4026-08ea-488c-9884-3cabaf9b4337",
+    "sdkVersion": "3",
+    "enableMultiJS": false,
+    "targetPlatforms": ["emery"],
+    "watchapp": {
+      "watchface": false
+    },
+    "messageKeys": [],
+    "resources": {
+      "media": []
+    },
+    "capabilities": ["health"]
+  }
+}
