@@ -15,6 +15,8 @@ static HrvBuffer s_minute_buf;
 static HrvBuffer s_night_buf;
 static time_t s_session_start = 0;
 static uint32_t s_night_baseline_var = 0;
+static uint32_t s_night_hr_sum = 0;
+static uint16_t s_night_hr_count = 0;
 static uint16_t s_mins[4] = {0, 0, 0, 0};
 static uint8_t s_awake_streak = 0;
 static SleepStage s_last_stage = StageLight;
@@ -34,6 +36,10 @@ static void prv_set_hrv(bool on) {
 
 static void prv_close_minute(void) {
   if (!s_recording) return;
+  if (s_last_hr > 0) {
+    s_night_hr_sum += s_last_hr;
+    s_night_hr_count++;
+  }
   EpochRecord rec;
   uint16_t total = s_minute_buf.count + (uint16_t)s_minute_buf.rejected;
   rec.mean_ppi = hrv_mean_ppi(&s_minute_buf);
@@ -97,6 +103,8 @@ static void prv_start_recording(void) {
   prv_set_hrv(true);
   s_session_start = time(NULL);
   s_night_baseline_var = 0;
+  s_night_hr_sum = 0;
+  s_night_hr_count = 0;
   s_awake_streak = 0;
   s_last_stage = StageLight;
   for (int i = 0; i < 4; i++) s_mins[i] = 0;
@@ -133,6 +141,8 @@ static void prv_stop_recording(void) {
   ns.rej_jump = s_night_buf.rej_jump;
   ns.start_time = s_session_start;
   ns.end_time = s_session_end;
+  ns.mean_hr = (s_night_hr_count > 0)
+    ? (uint16_t)(s_night_hr_sum / s_night_hr_count) : 0;
   if (ns.epoch_count >= 30) storage_night_save(&ns);
   s_mode = MODE_RESULTS;
   window_set_click_config_provider(s_window, prv_click_config);

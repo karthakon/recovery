@@ -30,6 +30,7 @@ typedef struct __attribute__((packed)) {
   uint32_t beats;  // true accepted-beat total (epoch_count is minutes)
   time_t start_time;
   time_t end_time;
+  uint16_t mean_hr;
 } NightSummary;
 
 void storage_session_start(void);
