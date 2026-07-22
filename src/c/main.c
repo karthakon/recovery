@@ -156,6 +156,7 @@ static void prv_stop_recording(void) {
   s_recording = false;
   s_session_end = time(NULL);
   NightSummary ns;
+  ns.date = s_session_start;
   ns.rmssd = hrv_rmssd(&s_night_buf);
   ns.sdnn = hrv_sdnn(&s_night_buf);
   ns.mean_ppi = hrv_mean_ppi(&s_night_buf);
