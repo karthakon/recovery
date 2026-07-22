@@ -13,7 +13,8 @@ const char *sleep_stage_name(SleepStage s) {
 SleepStage sleep_stage_classify(const HrvBuffer *minute_buf,
                                 uint32_t night_baseline_variance,
                                 uint16_t cur_hr,
-                                uint16_t baseline_hr) {
+                                uint16_t baseline_hr,
+                                bool movement) {
   HealthActivityMask act = health_service_peek_current_activities();
   // HR at least 3% below the night mean is positive sleep evidence and
   // vetoes a mask-driven Awake. Inert until a baseline exists.
@@ -22,8 +23,10 @@ SleepStage sleep_stage_classify(const HrvBuffer *minute_buf,
   // Deep is no longer classified live; it is queried as finalized
   // HealthMetricSleepRestfulSeconds at session stop. Live restful minutes
   // fall through to Light here so total sleep stays correct.
+  // Wake needs the mask AND corroboration: either movement, or HR that is
+  // not below the night mean. Still and low-HR stays asleep.
   if (!(act & HealthActivitySleep) && !(act & HealthActivityRestfulSleep)) {
-    if (!hr_says_sleep) return StageAwake;
+    if (movement || !hr_says_sleep) return StageAwake;
   }
   if (minute_buf->count >= 20 && night_baseline_variance > 0) {
     uint32_t v = hrv_ppi_variance(minute_buf);

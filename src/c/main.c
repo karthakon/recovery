@@ -12,12 +12,19 @@ static uint32_t s_hrv_events = 0;
 // mag2 in milli-g squared; 1g rest == 1000000. Display-only for now.
 static uint32_t s_mv_samples = 0;
 static uint32_t s_mv_moved = 0;
+static uint16_t s_mv_min_samples = 0;
+static uint16_t s_mv_min_moved = 0;
+#define MV_MOVED_PCT 10
 static void prv_accel_peek(void) {
   AccelData d;
   if (accel_service_peek(&d) != 0) return;
   int32_t mag2 = (int32_t)d.x * d.x + (int32_t)d.y * d.y + (int32_t)d.z * d.z;
   s_mv_samples++;
-  if (mag2 < 722500 || mag2 > 1322500) s_mv_moved++;
+  s_mv_min_samples++;
+  if (mag2 < 722500 || mag2 > 1322500) {
+    s_mv_moved++;
+    s_mv_min_moved++;
+  }
 }
 static uint16_t s_last_ppi = 0;
 static uint16_t s_last_hr = 0;
@@ -61,8 +68,14 @@ static void prv_close_minute(void) {
   rec.beat_count = (s_minute_buf.count > 255) ? 255 : (uint8_t)s_minute_buf.count;
   rec.quality_pct = (total > 0) ? (uint8_t)((s_minute_buf.count * 100) / total) : 0;
   rec.reserved = 0;
+  bool movement = (s_mv_min_samples > 0) &&
+    ((uint32_t)s_mv_min_moved * 100 >=
+     (uint32_t)s_mv_min_samples * MV_MOVED_PCT);
   SleepStage st = sleep_stage_classify(&s_minute_buf, s_night_baseline_var,
-                                       s_last_hr, s_night_baseline_hr);
+                                       s_last_hr, s_night_baseline_hr,
+                                       movement);
+  s_mv_min_samples = 0;
+  s_mv_min_moved = 0;
   if (st == StageAwake) {
     s_awake_streak++;
     if (s_awake_streak < AWAKE_DEBOUNCE) st = s_last_stage;
@@ -125,6 +138,8 @@ static void prv_start_recording(void) {
   s_night_hr_sum = 0;
   s_night_hr_count = 0;
   s_night_baseline_hr = 0;
+  s_mv_min_samples = 0;
+  s_mv_min_moved = 0;
   s_awake_streak = 0;
   s_last_stage = StageLight;
   for (int i = 0; i < 4; i++) s_mins[i] = 0;
