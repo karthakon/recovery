@@ -17,6 +17,7 @@ static time_t s_session_start = 0;
 static uint32_t s_night_baseline_var = 0;
 static uint32_t s_night_hr_sum = 0;
 static uint16_t s_night_hr_count = 0;
+static uint16_t s_night_baseline_hr = 0;
 static uint16_t s_mins[4] = {0, 0, 0, 0};
 static uint8_t s_awake_streak = 0;
 static SleepStage s_last_stage = StageLight;
@@ -47,7 +48,8 @@ static void prv_close_minute(void) {
   rec.beat_count = (s_minute_buf.count > 255) ? 255 : (uint8_t)s_minute_buf.count;
   rec.quality_pct = (total > 0) ? (uint8_t)((s_minute_buf.count * 100) / total) : 0;
   rec.reserved = 0;
-  SleepStage st = sleep_stage_classify(&s_minute_buf, s_night_baseline_var);
+  SleepStage st = sleep_stage_classify(&s_minute_buf, s_night_baseline_var,
+                                       s_last_hr, s_night_baseline_hr);
   if (st == StageAwake) {
     s_awake_streak++;
     if (s_awake_streak < AWAKE_DEBOUNCE) st = s_last_stage;
@@ -60,6 +62,9 @@ static void prv_close_minute(void) {
   storage_epoch_write(&rec);
   if (s_night_buf.count >= 60 && s_night_baseline_var == 0) {
     s_night_baseline_var = hrv_ppi_variance(&s_night_buf);
+  }
+  if (s_night_hr_count >= 20 && s_night_baseline_hr == 0) {
+    s_night_baseline_hr = (uint16_t)(s_night_hr_sum / s_night_hr_count);
   }
   hrv_buf_reset(&s_minute_buf);
 }
@@ -105,6 +110,7 @@ static void prv_start_recording(void) {
   s_night_baseline_var = 0;
   s_night_hr_sum = 0;
   s_night_hr_count = 0;
+  s_night_baseline_hr = 0;
   s_awake_streak = 0;
   s_last_stage = StageLight;
   for (int i = 0; i < 4; i++) s_mins[i] = 0;

@@ -10,5 +10,7 @@ typedef enum {
 } SleepStage;
 
 SleepStage sleep_stage_classify(const HrvBuffer *minute_buf,
-                                uint32_t night_baseline_variance);
+                                uint32_t night_baseline_variance,
+                                uint16_t cur_hr,
+                                uint16_t baseline_hr);
 const char *sleep_stage_name(SleepStage s);
