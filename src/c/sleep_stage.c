@@ -30,7 +30,7 @@ SleepStage sleep_stage_classify(const HrvBuffer *minute_buf,
   }
   if (minute_buf->count >= 20 && night_baseline_variance > 0) {
     uint32_t v = hrv_ppi_variance(minute_buf);
-    if (v * 2 > night_baseline_variance * 3) return StageREM;
+    if (v > night_baseline_variance * 2) return StageREM;
   }
   return StageLight;
 }
