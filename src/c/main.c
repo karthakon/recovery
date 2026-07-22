@@ -8,6 +8,17 @@ static Layer *s_canvas;
 static bool s_recording = false;
 static uint32_t s_hr_events = 0;
 static uint32_t s_hrv_events = 0;
+// Movement corroboration: accel_service_peek only, never subscribed.
+// mag2 in milli-g squared; 1g rest == 1000000. Display-only for now.
+static uint32_t s_mv_samples = 0;
+static uint32_t s_mv_moved = 0;
+static void prv_accel_peek(void) {
+  AccelData d;
+  if (accel_service_peek(&d) != 0) return;
+  int32_t mag2 = (int32_t)d.x * d.x + (int32_t)d.y * d.y + (int32_t)d.z * d.z;
+  s_mv_samples++;
+  if (mag2 < 722500 || mag2 > 1322500) s_mv_moved++;
+}
 static uint16_t s_last_ppi = 0;
 static uint16_t s_last_hr = 0;
 static HrvBuffer s_live_buf;
@@ -78,6 +89,7 @@ static void prv_tick_handler(struct tm *tick_time, TimeUnits changed) {
 }
 
 static void prv_health_handler(HealthEventType event, void *context) {
+  prv_accel_peek();
   if (event == HealthEventHeartRateUpdate) {
     s_hr_events++;
     HealthValue hr = health_service_peek_current_value(HealthMetricHeartRateRawBPM);
@@ -179,8 +191,9 @@ static void prv_draw_idle(Layer *layer, GContext *ctx) {
   graphics_draw_text(ctx, line, fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
     GRect(4, y, b.size.w - 8, 26), GTextOverflowModeTrailingEllipsis,
     GTextAlignmentLeft, NULL); y += 26;
-  snprintf(line, sizeof(line), "ev H%lu V%lu", (unsigned long)s_hr_events,
-    (unsigned long)s_hrv_events);
+  snprintf(line, sizeof(line), "ev H%lu V%lu M%lu/%lu",
+    (unsigned long)s_hr_events, (unsigned long)s_hrv_events,
+    (unsigned long)s_mv_moved, (unsigned long)s_mv_samples);
   graphics_draw_text(ctx, line, fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
     GRect(4, y, b.size.w - 8, 26), GTextOverflowModeTrailingEllipsis,
     GTextAlignmentLeft, NULL); y += 26;
