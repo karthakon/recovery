@@ -193,8 +193,15 @@ static void prv_draw_idle(Layer *layer, GContext *ctx) {
   graphics_draw_text(ctx, line, fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD),
     GRect(4, y, b.size.w - 8, 30), GTextOverflowModeTrailingEllipsis,
     GTextAlignmentLeft, NULL); y += 30;
-  uint32_t dur = s_recording ? (uint32_t)(time(NULL) - s_session_start) : 0;
-  snprintf(line, sizeof(line), "Dur %lu:%02lu", (unsigned long)(dur/60), (unsigned long)(dur%60));
+  if (s_recording) {
+    uint32_t dur = (uint32_t)(time(NULL) - s_session_start);
+    snprintf(line, sizeof(line), "Dur %lu:%02lu",
+      (unsigned long)(dur/60), (unsigned long)(dur%60));
+  } else {
+    char tbuf[16];
+    clock_copy_time_string(tbuf, sizeof(tbuf));
+    snprintf(line, sizeof(line), "%s", tbuf);
+  }
   graphics_draw_text(ctx, line, fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
     GRect(4, y, b.size.w - 8, 26), GTextOverflowModeTrailingEllipsis,
     GTextAlignmentLeft, NULL); y += 26;
