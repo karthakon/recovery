@@ -28,7 +28,9 @@ static time_t s_session_end = 0;
 static void prv_click_config(void *ctx);
 #define AWAKE_DEBOUNCE 3
 
-static bool s_hrv_on = true;
+// Firmware HRV sample period persists across app runs and prv_deinit sets
+// it to 0, so never assume it is on at launch. prv_init forces the write.
+static bool s_hrv_on = false;
 static void prv_set_hrv(bool on) {
   if (on == s_hrv_on) return;
   s_hrv_on = on;
@@ -365,6 +367,7 @@ static void prv_init(void) {
   hrv_buf_reset(&s_minute_buf);
   hrv_buf_reset(&s_night_buf);
   health_service_events_subscribe(prv_health_handler, NULL);
+  prv_set_hrv(true);
   tick_timer_service_subscribe(MINUTE_UNIT, prv_tick_handler);
 }
 
