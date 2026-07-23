@@ -272,6 +272,12 @@ static void prv_draw_results(Layer *layer, GContext *ctx) {
   graphics_draw_text(ctx, line, fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
     GRect(4, y, b.size.w - 8, 26), GTextOverflowModeTrailingEllipsis,
     GTextAlignmentLeft, NULL); y += 26;
+  snprintf(line, sizeof(line), "BASE %lu  NIGHT %lu",
+    (unsigned long)s_night_baseline_var,
+    (unsigned long)hrv_ppi_variance(&s_night_buf));
+  graphics_draw_text(ctx, line, fonts_get_system_font(FONT_KEY_GOTHIC_18),
+    GRect(4, y, b.size.w - 8, 22), GTextOverflowModeTrailingEllipsis,
+    GTextAlignmentLeft, NULL); y += 22;
   graphics_draw_text(ctx, "Down: graph",
     fonts_get_system_font(FONT_KEY_GOTHIC_18),
     GRect(4, y, b.size.w - 8, 22), GTextOverflowModeTrailingEllipsis,
