@@ -31,6 +31,10 @@ static uint16_t s_last_hr = 0;
 static HrvBuffer s_live_buf;
 static HrvBuffer s_minute_buf;
 static HrvBuffer s_night_buf;
+#define SLEEP_ONSET_MINUTES 5
+static uint16_t s_sleep_streak;
+static uint32_t s_onset_mark;
+static bool s_onset_marked;
 static time_t s_session_start = 0;
 static uint32_t s_night_baseline_var = 0;
 static uint32_t s_night_hr_sum = 0;
@@ -83,10 +87,17 @@ static void prv_close_minute(void) {
     s_awake_streak = 0;
   }
   s_last_stage = st;
+  if (st == StageAwake) {
+    s_sleep_streak = 0;
+  } else if (!s_onset_marked && ++s_sleep_streak >= SLEEP_ONSET_MINUTES) {
+    s_onset_mark = s_night_buf.total_accepted;
+    s_onset_marked = true;
+  }
   rec.stage = (uint8_t)st;
   s_mins[st]++;
   storage_epoch_write(&rec);
-  if (s_night_buf.count >= 60 && s_night_baseline_var == 0) {
+  if (s_onset_marked && s_night_baseline_var == 0 &&
+      (s_night_buf.total_accepted - s_onset_mark) >= HRV_BUF_MAX) {
     s_night_baseline_var = hrv_ppi_variance(&s_night_buf);
   }
   if (s_night_hr_count >= 20 && s_night_baseline_hr == 0) {
@@ -145,6 +156,9 @@ static void prv_start_recording(void) {
   for (int i = 0; i < 4; i++) s_mins[i] = 0;
   hrv_buf_reset(&s_minute_buf);
   hrv_buf_reset(&s_night_buf);
+  s_sleep_streak = 0;
+  s_onset_mark = 0;
+  s_onset_marked = false;
   storage_session_start();
   s_mode = MODE_RECORDING;
   window_set_click_config_provider(s_window, prv_click_config);
@@ -408,6 +422,9 @@ static void prv_init(void) {
   hrv_buf_reset(&s_live_buf);
   hrv_buf_reset(&s_minute_buf);
   hrv_buf_reset(&s_night_buf);
+  s_sleep_streak = 0;
+  s_onset_mark = 0;
+  s_onset_marked = false;
   health_service_events_subscribe(prv_health_handler, NULL);
   prv_set_hrv(true);
   tick_timer_service_subscribe(MINUTE_UNIT, prv_tick_handler);
