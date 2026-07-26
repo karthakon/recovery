@@ -92,6 +92,8 @@ static void prv_close_minute(void) {
   } else if (!s_onset_marked && ++s_sleep_streak >= SLEEP_ONSET_MINUTES) {
     s_onset_mark = s_night_buf.total_accepted;
     s_onset_marked = true;
+    s_night_hr_sum = 0;
+    s_night_hr_count = 0;
   }
   rec.stage = (uint8_t)st;
   s_mins[st]++;
@@ -100,7 +102,7 @@ static void prv_close_minute(void) {
       (s_night_buf.total_accepted - s_onset_mark) >= HRV_BUF_MAX) {
     s_night_baseline_var = hrv_ppi_variance(&s_night_buf);
   }
-  if (s_night_hr_count >= 20 && s_night_baseline_hr == 0) {
+  if (s_onset_marked && s_night_hr_count >= 20 && s_night_baseline_hr == 0) {
     s_night_baseline_hr = (uint16_t)(s_night_hr_sum / s_night_hr_count);
   }
   hrv_buf_reset(&s_minute_buf);
