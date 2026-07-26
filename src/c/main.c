@@ -37,6 +37,7 @@ static uint32_t s_onset_mark;
 static bool s_onset_marked;
 static time_t s_session_start = 0;
 static uint32_t s_night_baseline_var = 0;
+static uint32_t s_stop_night_var = 0;
 static uint32_t s_night_hr_sum = 0;
 static uint16_t s_night_hr_count = 0;
 static uint16_t s_night_baseline_hr = 0;
@@ -148,6 +149,7 @@ static void prv_start_recording(void) {
   prv_set_hrv(true);
   s_session_start = time(NULL);
   s_night_baseline_var = 0;
+  s_stop_night_var = 0;
   s_night_hr_sum = 0;
   s_night_hr_count = 0;
   s_night_baseline_hr = 0;
@@ -193,6 +195,9 @@ static void prv_stop_recording(void) {
   ns.end_time = s_session_end;
   ns.mean_hr = (s_night_hr_count > 0)
     ? (uint16_t)(s_night_hr_sum / s_night_hr_count) : 0;
+  ns.baseline_var = s_night_baseline_var;
+  ns.night_var = hrv_ppi_variance(&s_night_buf);
+  s_stop_night_var = ns.night_var;
   if (ns.epoch_count >= 30) storage_night_save(&ns);
   s_mode = MODE_RESULTS;
   window_set_click_config_provider(s_window, prv_click_config);
@@ -288,7 +293,7 @@ static void prv_draw_results(Layer *layer, GContext *ctx) {
     GTextAlignmentLeft, NULL); y += 26;
   snprintf(line, sizeof(line), "BASE %lu  NIGHT %lu",
     (unsigned long)s_night_baseline_var,
-    (unsigned long)hrv_ppi_variance(&s_night_buf));
+    (unsigned long)s_stop_night_var);
   graphics_draw_text(ctx, line, fonts_get_system_font(FONT_KEY_GOTHIC_18),
     GRect(4, y, b.size.w - 8, 22), GTextOverflowModeTrailingEllipsis,
     GTextAlignmentLeft, NULL); y += 22;

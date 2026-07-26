@@ -31,6 +31,8 @@ typedef struct __attribute__((packed)) {
   time_t start_time;
   time_t end_time;
   uint16_t mean_hr;
+  uint32_t baseline_var;  // BASE: frozen post-onset variance
+  uint32_t night_var;     // NIGHT: sliding-window variance at stop
 } NightSummary;
 
 void storage_session_start(void);
