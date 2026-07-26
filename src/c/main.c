@@ -38,6 +38,8 @@ static bool s_onset_marked;
 static time_t s_session_start = 0;
 static uint32_t s_night_baseline_var = 0;
 static uint32_t s_stop_night_var = 0;
+static uint8_t s_batt_start = 0;
+static uint8_t s_batt_end = 0;
 static uint32_t s_night_hr_sum = 0;
 static uint16_t s_night_hr_count = 0;
 static uint16_t s_night_baseline_hr = 0;
@@ -150,6 +152,8 @@ static void prv_start_recording(void) {
   s_session_start = time(NULL);
   s_night_baseline_var = 0;
   s_stop_night_var = 0;
+  s_batt_start = battery_state_service_peek().charge_percent;
+  s_batt_end = 0;
   s_night_hr_sum = 0;
   s_night_hr_count = 0;
   s_night_baseline_hr = 0;
@@ -198,6 +202,9 @@ static void prv_stop_recording(void) {
   ns.baseline_var = s_night_baseline_var;
   ns.night_var = hrv_ppi_variance(&s_night_buf);
   s_stop_night_var = ns.night_var;
+  s_batt_end = battery_state_service_peek().charge_percent;
+  ns.batt_start_pct = s_batt_start;
+  ns.batt_end_pct = s_batt_end;
   if (ns.epoch_count >= 30) storage_night_save(&ns);
   s_mode = MODE_RESULTS;
   window_set_click_config_provider(s_window, prv_click_config);
@@ -236,9 +243,9 @@ static void prv_draw_idle(Layer *layer, GContext *ctx) {
   snprintf(line, sizeof(line), "ev H%lu V%lu M%lu/%lu",
     (unsigned long)s_hr_events, (unsigned long)s_hrv_events,
     (unsigned long)s_mv_moved, (unsigned long)s_mv_samples);
-  graphics_draw_text(ctx, line, fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
-    GRect(4, y, b.size.w - 8, 26), GTextOverflowModeTrailingEllipsis,
-    GTextAlignmentLeft, NULL); y += 26;
+  graphics_draw_text(ctx, line, fonts_get_system_font(FONT_KEY_GOTHIC_14),
+    GRect(4, y, b.size.w - 8, 36), GTextOverflowModeWordWrap,
+    GTextAlignmentLeft, NULL); y += 36;
   snprintf(line, sizeof(line), "A%u L%u D%u R%u", s_mins[0], s_mins[1],
     s_mins[2], s_mins[3]);
   graphics_draw_text(ctx, line, fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
@@ -294,12 +301,24 @@ static void prv_draw_results(Layer *layer, GContext *ctx) {
   snprintf(line, sizeof(line), "BASE %lu  NIGHT %lu",
     (unsigned long)s_night_baseline_var,
     (unsigned long)s_stop_night_var);
-  graphics_draw_text(ctx, line, fonts_get_system_font(FONT_KEY_GOTHIC_18),
-    GRect(4, y, b.size.w - 8, 22), GTextOverflowModeTrailingEllipsis,
-    GTextAlignmentLeft, NULL); y += 22;
+  graphics_draw_text(ctx, line, fonts_get_system_font(FONT_KEY_GOTHIC_14),
+    GRect(4, y, b.size.w - 8, 18), GTextOverflowModeWordWrap,
+    GTextAlignmentLeft, NULL); y += 18;
+  snprintf(line, sizeof(line), "Batt %u>%u", s_batt_start, s_batt_end);
+  graphics_draw_text(ctx, line, fonts_get_system_font(FONT_KEY_GOTHIC_14),
+    GRect(4, y, b.size.w - 8, 18), GTextOverflowModeWordWrap,
+    GTextAlignmentLeft, NULL); y += 18;
+  snprintf(line, sizeof(line), "B%lu rej%lu rng%lu jmp%lu",
+    (unsigned long)s_night_buf.total_accepted,
+    (unsigned long)s_night_buf.rejected,
+    (unsigned long)s_night_buf.rej_range,
+    (unsigned long)s_night_buf.rej_jump);
+  graphics_draw_text(ctx, line, fonts_get_system_font(FONT_KEY_GOTHIC_14),
+    GRect(4, y, b.size.w - 8, 36), GTextOverflowModeWordWrap,
+    GTextAlignmentLeft, NULL); y += 36;
   graphics_draw_text(ctx, "Down: graph",
-    fonts_get_system_font(FONT_KEY_GOTHIC_18),
-    GRect(4, y, b.size.w - 8, 22), GTextOverflowModeTrailingEllipsis,
+    fonts_get_system_font(FONT_KEY_GOTHIC_14),
+    GRect(4, y, b.size.w - 8, 18), GTextOverflowModeWordWrap,
     GTextAlignmentLeft, NULL);
 }
 
