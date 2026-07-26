@@ -179,8 +179,6 @@ static void prv_stop_recording(void) {
                                          s_session_start, s_session_end);
   uint16_t deep_min = (deep_sec > 0) ? (uint16_t)(deep_sec / 60) : 0;
   s_mins[StageDeep] = deep_min;
-  if (deep_min <= s_mins[StageLight]) s_mins[StageLight] -= deep_min;
-  else s_mins[StageLight] = 0;
   ns.mins_awake = s_mins[StageAwake];
   ns.mins_light = s_mins[StageLight];
   ns.mins_deep = s_mins[StageDeep];
@@ -278,7 +276,7 @@ static void prv_draw_results(Layer *layer, GContext *ctx) {
   graphics_draw_text(ctx, line, fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
     GRect(4, y, b.size.w - 8, 26), GTextOverflowModeTrailingEllipsis,
     GTextAlignmentLeft, NULL); y += 26;
-  snprintf(line, sizeof(line), "Light %u  Deep %u", s_mins[StageLight], s_mins[StageDeep]);
+  snprintf(line, sizeof(line), "Light %u  OSrest %u", s_mins[StageLight], s_mins[StageDeep]);
   graphics_draw_text(ctx, line, fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
     GRect(4, y, b.size.w - 8, 26), GTextOverflowModeTrailingEllipsis,
     GTextAlignmentLeft, NULL); y += 26;
