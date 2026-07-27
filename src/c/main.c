@@ -37,6 +37,11 @@ static uint32_t s_onset_mark;
 static bool s_onset_marked;
 static time_t s_session_start = 0;
 static uint32_t s_night_baseline_var = 0;
+#define BASE_SAMPLE_MAX 24
+#define BASE_SAMPLE_MIN 3
+static uint32_t s_base_samples[BASE_SAMPLE_MAX];
+static uint8_t s_base_sample_count = 0;
+static uint32_t s_base_next_mark = 0;
 static uint32_t s_stop_night_var = 0;
 static uint8_t s_batt_start = 0;
 static uint8_t s_batt_end = 0;
@@ -60,6 +65,19 @@ static void prv_set_hrv(bool on) {
   if (on == s_hrv_on) return;
   s_hrv_on = on;
   health_service_set_hrv_sample_period(on ? 1 : 0);
+}
+
+static uint32_t prv_base_median(void) {
+  if (s_base_sample_count == 0) return 0;
+  uint32_t tmp[BASE_SAMPLE_MAX];
+  for (uint8_t i = 0; i < s_base_sample_count; i++) tmp[i] = s_base_samples[i];
+  for (uint8_t i = 1; i < s_base_sample_count; i++) {
+    uint32_t key = tmp[i];
+    int8_t j = (int8_t)i - 1;
+    while (j >= 0 && tmp[j] > key) { tmp[j + 1] = tmp[j]; j--; }
+    tmp[j + 1] = key;
+  }
+  return tmp[(s_base_sample_count - 1) / 2];
 }
 
 static void prv_close_minute(void) {
@@ -101,9 +119,19 @@ static void prv_close_minute(void) {
   rec.stage = (uint8_t)st;
   s_mins[st]++;
   storage_epoch_write(&rec);
-  if (s_onset_marked && s_night_baseline_var == 0 &&
-      (s_night_buf.total_accepted - s_onset_mark) >= HRV_BUF_MAX) {
-    s_night_baseline_var = hrv_ppi_variance(&s_night_buf);
+  if (s_onset_marked && s_base_sample_count < BASE_SAMPLE_MAX) {
+    if (s_base_next_mark == 0) {
+      s_base_next_mark = s_onset_mark + HRV_BUF_MAX;
+    }
+    if (s_night_buf.total_accepted >= s_base_next_mark) {
+      s_base_samples[s_base_sample_count++] = hrv_ppi_variance(&s_night_buf);
+      s_base_next_mark += HRV_BUF_MAX;
+      if (s_base_sample_count >= BASE_SAMPLE_MIN) {
+        s_night_baseline_var = prv_base_median();
+      } else if (s_base_sample_count == 1) {
+        s_night_baseline_var = s_base_samples[0];
+      }
+    }
   }
   if (s_onset_marked && s_night_hr_count >= 20 && s_night_baseline_hr == 0) {
     s_night_baseline_hr = (uint16_t)(s_night_hr_sum / s_night_hr_count);
@@ -151,6 +179,8 @@ static void prv_start_recording(void) {
   prv_set_hrv(true);
   s_session_start = time(NULL);
   s_night_baseline_var = 0;
+  s_base_sample_count = 0;
+  s_base_next_mark = 0;
   s_stop_night_var = 0;
   s_batt_start = battery_state_service_peek().charge_percent;
   s_batt_end = 0;
@@ -298,8 +328,9 @@ static void prv_draw_results(Layer *layer, GContext *ctx) {
   graphics_draw_text(ctx, line, fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
     GRect(4, y, b.size.w - 8, 26), GTextOverflowModeTrailingEllipsis,
     GTextAlignmentLeft, NULL); y += 26;
-  snprintf(line, sizeof(line), "BASE %lu  NIGHT %lu",
+  snprintf(line, sizeof(line), "BASE %lu/n%u  NIGHT %lu",
     (unsigned long)s_night_baseline_var,
+    (unsigned)s_base_sample_count,
     (unsigned long)s_stop_night_var);
   graphics_draw_text(ctx, line, fonts_get_system_font(FONT_KEY_GOTHIC_14),
     GRect(4, y, b.size.w - 8, 18), GTextOverflowModeWordWrap,
@@ -449,6 +480,8 @@ static void prv_init(void) {
   s_sleep_streak = 0;
   s_onset_mark = 0;
   s_onset_marked = false;
+  s_base_sample_count = 0;
+  s_base_next_mark = 0;
   health_service_events_subscribe(prv_health_handler, NULL);
   prv_set_hrv(true);
   tick_timer_service_subscribe(MINUTE_UNIT, prv_tick_handler);
