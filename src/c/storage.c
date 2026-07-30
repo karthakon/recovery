@@ -52,6 +52,14 @@ bool storage_epoch_read(uint16_t idx, EpochRecord *out) {
   *out = s_key_buf[slot];
   return true;
 }
+void storage_epoch_update(uint16_t idx, const EpochRecord *rec) {
+  if (idx >= storage_epoch_count()) return;
+  uint16_t key = KEY_EPOCH_BASE + (idx / EPOCHS_PER_KEY);
+  uint16_t slot = idx % EPOCHS_PER_KEY;
+  if (persist_read_data(key, s_key_buf, sizeof(s_key_buf)) != (int)sizeof(s_key_buf)) return;
+  s_key_buf[slot] = *rec;
+  persist_write_data(key, s_key_buf, sizeof(s_key_buf));
+}
 
 static void prv_night_meta(NightMeta *m) {
   if (persist_read_data(KEY_NIGHT_META, m, sizeof(*m)) != (int)sizeof(*m)) {

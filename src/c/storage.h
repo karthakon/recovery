@@ -41,6 +41,7 @@ void storage_session_start(void);
 void storage_epoch_write(const EpochRecord *rec);
 uint16_t storage_epoch_count(void);
 bool storage_epoch_read(uint16_t idx, EpochRecord *out);
+void storage_epoch_update(uint16_t idx, const EpochRecord *rec);
 void storage_night_save(const NightSummary *ns);
 uint8_t storage_night_count(void);
 bool storage_night_read(uint8_t idx_from_newest, NightSummary *out);

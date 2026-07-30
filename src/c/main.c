@@ -2,6 +2,7 @@
 #include "hrv_math.h"
 #include "storage.h"
 #include "sleep_stage.h"
+#include "smoother.h"
 
 static Window *s_window;
 static Layer *s_canvas;
@@ -205,6 +206,7 @@ static void prv_start_recording(void) {
 
 static void prv_stop_recording(void) {
   prv_close_minute();
+  smoother_run(s_mins);
   s_recording = false;
   s_session_end = time(NULL);
   NightSummary ns;
