@@ -59,6 +59,7 @@ static uint8_t s_hist_idx = 0;      // 0 = newest
 static uint8_t s_hist_count = 0;    // populated nights at entry
 static bool s_hist_ok = false;      // last storage_night_read result
 static NightSummary s_hist_ns;      // currently loaded night
+static uint8_t s_hist_slot[MAX_NIGHTS]; // list-position -> physical idx-from-newest (readable only)
 static time_t s_session_end = 0;
 static void prv_click_config(void *ctx);
 #define AWAKE_DEBOUNCE 3
@@ -516,12 +517,20 @@ static void prv_results_to_idle(ClickRecognizerRef r, void *ctx) {
 }
 
 static void prv_hist_load(void) {
-  s_hist_ok = storage_night_read(s_hist_idx, &s_hist_ns);
+  s_hist_ok = storage_night_read(s_hist_slot[s_hist_idx], &s_hist_ns);
 }
 
 static void prv_idle_to_history(ClickRecognizerRef r, void *ctx) {
   if (s_recording) return;
-  s_hist_count = storage_night_count();
+  uint8_t phys = storage_night_count();
+  s_hist_count = 0;
+  for (uint8_t i = 0; i < phys; i++) {
+    NightSummary tmp;
+    if (storage_night_read(i, &tmp)) {
+      s_hist_slot[s_hist_count] = i;
+      s_hist_count++;
+    }
+  }
   s_hist_idx = 0;
   s_hist_ok = false;
   if (s_hist_count > 0) prv_hist_load();
