@@ -77,7 +77,9 @@ void storage_night_save(const NightSummary *ns) {
   } else {
     slot = (m.newest_slot + 1) % MAX_NIGHTS;
   }
-  persist_write_data(KEY_NIGHT_BASE + slot, ns, sizeof(*ns));
+  NightSummary stamped = *ns;
+  stamped.version = NIGHT_SUMMARY_VERSION;
+  persist_write_data(KEY_NIGHT_BASE + slot, &stamped, sizeof(stamped));
   m.newest_slot = slot;
   if (m.night_count < MAX_NIGHTS) m.night_count++;
   persist_write_data(KEY_NIGHT_META, &m, sizeof(m));
@@ -147,5 +149,7 @@ bool storage_night_read(uint8_t idx_from_newest, NightSummary *out) {
   if (idx_from_newest >= m.night_count) return false;
   int slot = ((int)m.newest_slot - (int)idx_from_newest + MAX_NIGHTS) % MAX_NIGHTS;
   int r = persist_read_data(KEY_NIGHT_BASE + slot, out, sizeof(*out));
-  return r == (int)sizeof(*out);
+  if (r != (int)sizeof(*out)) return false;
+  if (out->version != NIGHT_SUMMARY_VERSION) return false;
+  return true;
 }

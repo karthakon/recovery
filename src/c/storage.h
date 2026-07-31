@@ -14,7 +14,9 @@ typedef struct __attribute__((packed)) {
   uint8_t reserved;
 } EpochRecord;
 
+#define NIGHT_SUMMARY_VERSION 1
 typedef struct __attribute__((packed)) {
+  uint8_t version;  // NIGHT_SUMMARY_VERSION at save time; 0 = pre-versioning
   time_t date;
   uint16_t rmssd;
   uint16_t sdnn;
