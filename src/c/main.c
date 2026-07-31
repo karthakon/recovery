@@ -536,17 +536,18 @@ static void prv_hist_older(ClickRecognizerRef r, void *ctx) {
   layer_mark_dirty(s_canvas);
 }
 
-static void prv_hist_newer(ClickRecognizerRef r, void *ctx) {
-  if (s_hist_count == 0) return;
-  if (s_hist_idx > 0) { s_hist_idx--; prv_hist_load(); }
-  layer_mark_dirty(s_canvas);
-}
-
 static void prv_hist_to_idle(ClickRecognizerRef r, void *ctx) {
   s_mode = MODE_IDLE;
   window_set_click_config_provider(s_window, prv_click_config);
   layer_mark_dirty(s_canvas);
 }
+
+static void prv_hist_newer(ClickRecognizerRef r, void *ctx) {
+  if (s_hist_count == 0 || s_hist_idx == 0) { prv_hist_to_idle(r, ctx); return; }
+  s_hist_idx--; prv_hist_load();
+  layer_mark_dirty(s_canvas);
+}
+
 
 static void prv_click_config(void *ctx) {
   switch (s_mode) {
