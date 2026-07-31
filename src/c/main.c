@@ -53,8 +53,12 @@ static uint16_t s_mins[4] = {0, 0, 0, 0};
 static uint8_t s_awake_streak = 0;
 static SleepStage s_last_stage = StageLight;
 static AppTimer *s_ui_timer = NULL;
-typedef enum { MODE_IDLE, MODE_RECORDING, MODE_RESULTS, MODE_HYPNO } ScreenMode;
+typedef enum { MODE_IDLE, MODE_RECORDING, MODE_RESULTS, MODE_HYPNO, MODE_HISTORY } ScreenMode;
 static ScreenMode s_mode = MODE_IDLE;
+static uint8_t s_hist_idx = 0;      // 0 = newest
+static uint8_t s_hist_count = 0;    // populated nights at entry
+static bool s_hist_ok = false;      // last storage_night_read result
+static NightSummary s_hist_ns;      // currently loaded night
 static time_t s_session_end = 0;
 static void prv_click_config(void *ctx);
 #define AWAKE_DEBOUNCE 3
@@ -398,11 +402,86 @@ static void prv_draw_hypno(Layer *layer, GContext *ctx) {
   }
 }
 
+static void prv_draw_history(Layer *layer, GContext *ctx) {
+  GRect b = layer_get_bounds(layer);
+  graphics_context_set_text_color(ctx, GColorBlack);
+  char line[64];
+  int y = 2;
+
+  if (s_hist_count == 0) {
+    graphics_draw_text(ctx, "No nights",
+      fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD),
+      GRect(4, y, b.size.w - 8, 30), GTextOverflowModeTrailingEllipsis,
+      GTextAlignmentLeft, NULL);
+    return;
+  }
+
+  snprintf(line, sizeof(line), "Night %u/%u",
+    (unsigned)(s_hist_idx + 1), (unsigned)s_hist_count);
+  graphics_draw_text(ctx, line, fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD),
+    GRect(4, y, b.size.w - 8, 30), GTextOverflowModeTrailingEllipsis,
+    GTextAlignmentLeft, NULL); y += 30;
+
+  if (!s_hist_ok) {
+    snprintf(line, sizeof(line), "v%u mismatch", (unsigned)s_hist_ns.version);
+    graphics_draw_text(ctx, line, fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
+      GRect(4, y, b.size.w - 8, 26), GTextOverflowModeTrailingEllipsis,
+      GTextAlignmentLeft, NULL); y += 26;
+    graphics_draw_text(ctx, "UP older  DOWN newer",
+      fonts_get_system_font(FONT_KEY_GOTHIC_14),
+      GRect(4, y, b.size.w - 8, 18), GTextOverflowModeWordWrap,
+      GTextAlignmentLeft, NULL);
+    return;
+  }
+
+  char dbuf[16], sbuf[16], ebuf[16];
+  time_t t_date = s_hist_ns.date;
+  time_t t_start = s_hist_ns.start_time;
+  time_t t_end = s_hist_ns.end_time;
+  strftime(dbuf, sizeof(dbuf), "%b %d", localtime(&t_date));
+  strftime(sbuf, sizeof(sbuf), "%l:%M%P", localtime(&t_start));
+  strftime(ebuf, sizeof(ebuf), "%l:%M%P", localtime(&t_end));
+  snprintf(line, sizeof(line), "%s %s-%s", dbuf, sbuf, ebuf);
+  graphics_draw_text(ctx, line, fonts_get_system_font(FONT_KEY_GOTHIC_18),
+    GRect(4, y, b.size.w - 8, 22), GTextOverflowModeTrailingEllipsis,
+    GTextAlignmentLeft, NULL); y += 22;
+
+  snprintf(line, sizeof(line), "Awake %u  REM %u",
+    s_hist_ns.mins_awake, s_hist_ns.mins_rem);
+  graphics_draw_text(ctx, line, fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
+    GRect(4, y, b.size.w - 8, 26), GTextOverflowModeTrailingEllipsis,
+    GTextAlignmentLeft, NULL); y += 26;
+
+  snprintf(line, sizeof(line), "Light %u  OSrest %u",
+    s_hist_ns.mins_light, s_hist_ns.mins_deep);
+  graphics_draw_text(ctx, line, fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
+    GRect(4, y, b.size.w - 8, 26), GTextOverflowModeTrailingEllipsis,
+    GTextAlignmentLeft, NULL); y += 26;
+
+  snprintf(line, sizeof(line), "RMSSD %u  BASE %lu",
+    s_hist_ns.rmssd, (unsigned long)s_hist_ns.baseline_var);
+  graphics_draw_text(ctx, line, fonts_get_system_font(FONT_KEY_GOTHIC_14),
+    GRect(4, y, b.size.w - 8, 18), GTextOverflowModeWordWrap,
+    GTextAlignmentLeft, NULL); y += 18;
+
+  snprintf(line, sizeof(line), "Batt %u>%u",
+    s_hist_ns.batt_start_pct, s_hist_ns.batt_end_pct);
+  graphics_draw_text(ctx, line, fonts_get_system_font(FONT_KEY_GOTHIC_14),
+    GRect(4, y, b.size.w - 8, 18), GTextOverflowModeWordWrap,
+    GTextAlignmentLeft, NULL); y += 18;
+
+  graphics_draw_text(ctx, "UP older  DOWN newer",
+    fonts_get_system_font(FONT_KEY_GOTHIC_14),
+    GRect(4, y, b.size.w - 8, 18), GTextOverflowModeWordWrap,
+    GTextAlignmentLeft, NULL);
+}
+
 static void prv_canvas_update(Layer *layer, GContext *ctx) {
   switch (s_mode) {
     case MODE_RECORDING: prv_draw_recording(layer, ctx); break;
     case MODE_RESULTS:   prv_draw_results(layer, ctx);   break;
     case MODE_HYPNO:     prv_draw_hypno(layer, ctx);     break;
+    case MODE_HISTORY:   prv_draw_history(layer, ctx);   break;
     case MODE_IDLE:
     default:             prv_draw_idle(layer, ctx);      break;
   }
@@ -436,10 +515,44 @@ static void prv_results_to_idle(ClickRecognizerRef r, void *ctx) {
   layer_mark_dirty(s_canvas);
 }
 
+static void prv_hist_load(void) {
+  s_hist_ok = storage_night_read(s_hist_idx, &s_hist_ns);
+}
+
+static void prv_idle_to_history(ClickRecognizerRef r, void *ctx) {
+  if (s_recording) return;
+  s_hist_count = storage_night_count();
+  s_hist_idx = 0;
+  s_hist_ok = false;
+  if (s_hist_count > 0) prv_hist_load();
+  s_mode = MODE_HISTORY;
+  window_set_click_config_provider(s_window, prv_click_config);
+  layer_mark_dirty(s_canvas);
+}
+
+static void prv_hist_older(ClickRecognizerRef r, void *ctx) {
+  if (s_hist_count == 0) return;
+  if (s_hist_idx + 1 < s_hist_count) { s_hist_idx++; prv_hist_load(); }
+  layer_mark_dirty(s_canvas);
+}
+
+static void prv_hist_newer(ClickRecognizerRef r, void *ctx) {
+  if (s_hist_count == 0) return;
+  if (s_hist_idx > 0) { s_hist_idx--; prv_hist_load(); }
+  layer_mark_dirty(s_canvas);
+}
+
+static void prv_hist_to_idle(ClickRecognizerRef r, void *ctx) {
+  s_mode = MODE_IDLE;
+  window_set_click_config_provider(s_window, prv_click_config);
+  layer_mark_dirty(s_canvas);
+}
+
 static void prv_click_config(void *ctx) {
   switch (s_mode) {
     case MODE_IDLE:
       window_long_click_subscribe(BUTTON_ID_SELECT, 1500, prv_start_long, NULL);
+      window_single_click_subscribe(BUTTON_ID_UP, prv_idle_to_history);
       window_single_click_subscribe(BUTTON_ID_BACK, prv_idle_exit);
       break;
     case MODE_RECORDING:
@@ -454,6 +567,11 @@ static void prv_click_config(void *ctx) {
     case MODE_HYPNO:
       window_single_click_subscribe(BUTTON_ID_UP, prv_hypno_back_to_results);
       window_single_click_subscribe(BUTTON_ID_BACK, prv_hypno_back_to_results);
+      break;
+    case MODE_HISTORY:
+      window_single_click_subscribe(BUTTON_ID_UP, prv_hist_older);
+      window_single_click_subscribe(BUTTON_ID_DOWN, prv_hist_newer);
+      window_single_click_subscribe(BUTTON_ID_BACK, prv_hist_to_idle);
       break;
   }
 }
