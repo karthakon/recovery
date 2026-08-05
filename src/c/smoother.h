@@ -4,8 +4,10 @@
 // Runs once at stop time as a post-pass over stored epochs.
 // Three states only (Awake, Light, REM); Deep is next-action 4.
 // Rewrites each EpochRecord.stage to the smoothed value and preserves
-// the raw classifier stage in EpochRecord.reserved. Does NOT touch
-// onset marking or BASE sampling (spec section 0).
+// the pre-smoother stage in EpochRecord.reserved. As of base-spec-v1
+// that pre-smoother stage is the whole-night-BASE re-decided stage,
+// not the live-BASE one. Does NOT touch onset marking or BASE sampling
+// (smoothing spec section 0).
 //
 // out_mins receives recomputed minute totals indexed by SleepStage,
 // for StageAwake/StageLight/StageREM only. Caller keeps StageDeep.

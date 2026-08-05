@@ -38,11 +38,14 @@ static uint32_t s_onset_mark;
 static bool s_onset_marked;
 static time_t s_session_start = 0;
 static uint32_t s_night_baseline_var = 0;
-#define BASE_SAMPLE_MAX 24
+#define BASE_SAMPLE_MAX 160   // safety bound, not a modelling parameter (base-spec-v1 s3.1)
+#define EPOCH_VAR_MAX 960     // 16 h of per-minute variance, RAM only (base-spec-v1 s4)
 #define BASE_SAMPLE_MIN 3
 static uint32_t s_base_samples[BASE_SAMPLE_MAX];
 static uint8_t s_base_sample_count = 0;
 static uint32_t s_base_next_mark = 0;
+static uint32_t s_epoch_var[EPOCH_VAR_MAX];
+static uint16_t s_epoch_var_count = 0;
 static uint32_t s_stop_night_var = 0;
 static uint8_t s_batt_start = 0;
 static uint8_t s_batt_end = 0;
@@ -75,11 +78,11 @@ static void prv_set_hrv(bool on) {
 
 static uint32_t prv_base_median(void) {
   if (s_base_sample_count == 0) return 0;
-  uint32_t tmp[BASE_SAMPLE_MAX];
-  for (uint8_t i = 0; i < s_base_sample_count; i++) tmp[i] = s_base_samples[i];
-  for (uint8_t i = 1; i < s_base_sample_count; i++) {
+  static uint32_t tmp[BASE_SAMPLE_MAX];
+  for (uint16_t i = 0; i < s_base_sample_count; i++) tmp[i] = s_base_samples[i];
+  for (uint16_t i = 1; i < s_base_sample_count; i++) {
     uint32_t key = tmp[i];
-    int8_t j = (int8_t)i - 1;
+    int16_t j = (int16_t)i - 1;
     while (j >= 0 && tmp[j] > key) { tmp[j + 1] = tmp[j]; j--; }
     tmp[j + 1] = key;
   }
@@ -125,6 +128,11 @@ static void prv_close_minute(void) {
   rec.stage = (uint8_t)st;
   s_mins[st]++;
   storage_epoch_write(&rec);
+  // base-spec-v1 s4: RAM-only per-minute variance for the stop-time
+  // re-decision pass. Captured before the minute buffer is reset.
+  if (s_epoch_var_count < EPOCH_VAR_MAX) {
+    s_epoch_var[s_epoch_var_count++] = hrv_ppi_variance(&s_minute_buf);
+  }
   if (s_onset_marked && s_base_sample_count < BASE_SAMPLE_MAX) {
     if (s_base_next_mark == 0) {
       s_base_next_mark = s_onset_mark + HRV_BUF_MAX;
@@ -185,6 +193,7 @@ static void prv_start_recording(void) {
   prv_set_hrv(true);
   s_session_start = time(NULL);
   s_night_baseline_var = 0;
+  s_epoch_var_count = 0;
   s_base_sample_count = 0;
   s_base_next_mark = 0;
   s_stop_night_var = 0;
@@ -209,8 +218,39 @@ static void prv_start_recording(void) {
   layer_mark_dirty(s_canvas);
 }
 
+// base-spec-v1 s3.4: re-decide Light vs REM against the whole-night BASE.
+// Awake is untouched (s2) and runs before smoother_run (s3.5).
+static void prv_base_redecide(uint32_t base_final) {
+  if (base_final == 0) return;
+  uint16_t n = storage_epoch_count();
+  if (n > s_epoch_var_count) n = s_epoch_var_count;
+  for (uint16_t i = 0; i < n; i++) {
+    EpochRecord rec;
+    if (!storage_epoch_read(i, &rec)) continue;
+    if (rec.stage == (uint8_t)StageAwake) continue;   // s3.4 step 2
+    if (rec.beat_count < 20) continue;                // s3.4 step 3
+    uint32_t v = s_epoch_var[i];
+    if (v == 0) continue;                             // s3.4 step 4
+    SleepStage ns_stage;
+    if (v * 2 >= base_final && v <= base_final * 2) {
+      ns_stage = StageLight;
+    } else if (v > base_final * 2) {
+      ns_stage = StageREM;
+    } else {
+      ns_stage = StageLight;
+    }
+    if ((uint8_t)ns_stage == rec.stage) continue;
+    if (s_mins[rec.stage] > 0) s_mins[rec.stage]--;
+    s_mins[ns_stage]++;
+    rec.stage = (uint8_t)ns_stage;
+    storage_epoch_update(i, &rec);
+  }
+}
+
 static void prv_stop_recording(void) {
   prv_close_minute();
+  s_night_baseline_var = prv_base_median();   // s3.3 whole-night BASE
+  prv_base_redecide(s_night_baseline_var);    // s3.4, before the smoother
   smoother_run(s_mins);
   s_recording = false;
   s_session_end = time(NULL);
