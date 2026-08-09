@@ -56,7 +56,7 @@ static uint16_t s_mins[4] = {0, 0, 0, 0};
 static uint8_t s_awake_streak = 0;
 static SleepStage s_last_stage = StageLight;
 static AppTimer *s_ui_timer = NULL;
-typedef enum { MODE_IDLE, MODE_RECORDING, MODE_RESULTS, MODE_HYPNO, MODE_HISTORY } ScreenMode;
+typedef enum { MODE_IDLE, MODE_RECORDING, MODE_RESULTS, MODE_HYPNO, MODE_HISTORY, MODE_DIAG } ScreenMode;
 static ScreenMode s_mode = MODE_IDLE;
 static uint8_t s_hist_idx = 0;      // 0 = newest
 static uint8_t s_hist_count = 0;    // populated nights at entry
@@ -218,6 +218,63 @@ static void prv_start_recording(void) {
   layer_mark_dirty(s_canvas);
 }
 
+// measurement-spec-v1 s3.2: statistics over the per-minute variance
+// population and the BASE sample distribution. READ-ONLY with respect to
+// staging - writes no EpochRecord, touches no s_mins element, changes no
+// stage. s3.4 requires it to run AFTER prv_base_redecide because it sorts
+// s_epoch_var in place.
+static uint32_t s_v_max, s_v_p90, s_v_median, s_base_min, s_base_max;
+static uint16_t s_v_count, s_v_over_gate;
+
+static void prv_measure(uint32_t base_final) {
+  s_v_max = 0; s_v_p90 = 0; s_v_median = 0;
+  s_base_min = 0; s_base_max = 0;
+  s_v_count = 0; s_v_over_gate = 0;
+
+  // s3.1: qualifying population is v > 0, compacted to the front in place.
+  uint16_t n = 0;
+  for (uint16_t i = 0; i < s_epoch_var_count; i++) {
+    if (s_epoch_var[i] > 0) s_epoch_var[n++] = s_epoch_var[i];
+  }
+  s_v_count = n;
+  if (n == 0) return;
+
+  // s3.3: in-place insertion sort, ascending. Integer only.
+  for (uint16_t i = 1; i < n; i++) {
+    uint32_t key = s_epoch_var[i];
+    int32_t j = (int32_t)i - 1;
+    while (j >= 0 && s_epoch_var[j] > key) {
+      s_epoch_var[j + 1] = s_epoch_var[j];
+      j--;
+    }
+    s_epoch_var[j + 1] = key;
+  }
+
+  s_v_max = s_epoch_var[n - 1];
+  s_v_median = s_epoch_var[n / 2];          // s3.2: upper-middle, no averaging
+  uint32_t pi = ((uint32_t)n * 9) / 10;
+  if (pi > (uint32_t)(n - 1)) pi = n - 1;   // s3.2: clamped
+  s_v_p90 = s_epoch_var[pi];
+
+  if (base_final > 0) {
+    uint32_t gate = base_final * 2;
+    for (uint16_t i = 0; i < n; i++) {
+      if (s_epoch_var[i] > gate) s_v_over_gate++;
+    }
+  }
+
+  // s3.2: BASE sample extremes by linear scan; no sort needed.
+  if (s_base_sample_count > 0) {
+    s_base_min = s_base_samples[0];
+    s_base_max = s_base_samples[0];
+    for (uint16_t i = 1; i < s_base_sample_count; i++) {
+      uint32_t v = s_base_samples[i];
+      if (v < s_base_min) s_base_min = v;
+      if (v > s_base_max) s_base_max = v;
+    }
+  }
+}
+
 // base-spec-v1 s3.4: re-decide Light vs REM against the whole-night BASE.
 // Awake is untouched (s2) and runs before smoother_run (s3.5).
 static void prv_base_redecide(uint32_t base_final) {
@@ -251,6 +308,7 @@ static void prv_stop_recording(void) {
   prv_close_minute();
   s_night_baseline_var = prv_base_median();   // s3.3 whole-night BASE
   prv_base_redecide(s_night_baseline_var);    // s3.4, before the smoother
+  prv_measure(s_night_baseline_var);           // measurement-spec-v1 s3.4
   smoother_run(s_mins);
   s_recording = false;
   s_session_end = time(NULL);
@@ -282,6 +340,13 @@ static void prv_stop_recording(void) {
   s_batt_end = battery_state_service_peek().charge_percent;
   ns.batt_start_pct = s_batt_start;
   ns.batt_end_pct = s_batt_end;
+  ns.v_max = s_v_max;
+  ns.v_p90 = s_v_p90;
+  ns.v_median = s_v_median;
+  ns.base_min = s_base_min;
+  ns.base_max = s_base_max;
+  ns.v_count = s_v_count;
+  ns.v_over_gate_count = s_v_over_gate;
   if (ns.epoch_count >= 30) storage_night_save(&ns);
   s_mode = MODE_RESULTS;
   window_set_click_config_provider(s_window, prv_click_config);
@@ -517,11 +582,58 @@ static void prv_draw_history(Layer *layer, GContext *ctx) {
     GTextAlignmentLeft, NULL);
 }
 
+// measurement-spec-v1 s3.6: DIAG is a diagnostic screen. RESULTS is
+// unchanged. A v1 record has no measured tail, so it prints -- rather
+// than 0 - zero is a meaningful measured value here.
+static void prv_draw_diag(Layer *layer, GContext *ctx) {
+  GRect b = layer_get_bounds(layer);
+  graphics_context_set_text_color(ctx, GColorBlack);
+  char line[64];
+  int y = 2;
+  GFont f = fonts_get_system_font(FONT_KEY_GOTHIC_14);
+  snprintf(line, sizeof(line), "Diag");
+  graphics_draw_text(ctx, line, fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
+    GRect(4, y, b.size.w - 8, 26), GTextOverflowModeTrailingEllipsis,
+    GTextAlignmentLeft, NULL); y += 26;
+  if (s_v_count == 0) {
+    snprintf(line, sizeof(line), "Vmax --  P90 --");
+    graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+    snprintf(line, sizeof(line), "Vmed --  Vn 0");
+    graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+    snprintf(line, sizeof(line), "Gate --");
+    graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  } else {
+    snprintf(line, sizeof(line), "Vmax %lu", (unsigned long)s_v_max);
+    graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+    snprintf(line, sizeof(line), "P90 %lu  Vmed %lu",
+      (unsigned long)s_v_p90, (unsigned long)s_v_median);
+    graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+    snprintf(line, sizeof(line), "Vn %u  Gate %u",
+      (unsigned)s_v_count, (unsigned)s_v_over_gate);
+    graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  }
+  snprintf(line, sizeof(line), "Bmin %lu  Bmax %lu",
+    (unsigned long)s_base_min, (unsigned long)s_base_max);
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  snprintf(line, sizeof(line), "BASE %lu  x2 %lu",
+    (unsigned long)s_night_baseline_var, (unsigned long)(s_night_baseline_var * 2));
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+}
+
 static void prv_canvas_update(Layer *layer, GContext *ctx) {
   switch (s_mode) {
     case MODE_RECORDING: prv_draw_recording(layer, ctx); break;
     case MODE_RESULTS:   prv_draw_results(layer, ctx);   break;
     case MODE_HYPNO:     prv_draw_hypno(layer, ctx);     break;
+    case MODE_DIAG:      prv_draw_diag(layer, ctx);      break;
     case MODE_HISTORY:   prv_draw_history(layer, ctx);   break;
     case MODE_IDLE:
     default:             prv_draw_idle(layer, ctx);      break;
@@ -598,6 +710,16 @@ static void prv_hist_newer(ClickRecognizerRef r, void *ctx) {
 }
 
 
+static void prv_hypno_to_diag(ClickRecognizerRef r, void *ctx) {
+  s_mode = MODE_DIAG;
+  window_set_click_config_provider(s_window, prv_click_config);
+  layer_mark_dirty(s_canvas);
+}
+static void prv_diag_to_hypno(ClickRecognizerRef r, void *ctx) {
+  s_mode = MODE_HYPNO;
+  window_set_click_config_provider(s_window, prv_click_config);
+  layer_mark_dirty(s_canvas);
+}
 static void prv_click_config(void *ctx) {
   switch (s_mode) {
     case MODE_IDLE:
@@ -616,7 +738,12 @@ static void prv_click_config(void *ctx) {
       break;
     case MODE_HYPNO:
       window_single_click_subscribe(BUTTON_ID_UP, prv_hypno_back_to_results);
+      window_single_click_subscribe(BUTTON_ID_DOWN, prv_hypno_to_diag);
       window_single_click_subscribe(BUTTON_ID_BACK, prv_hypno_back_to_results);
+      break;
+    case MODE_DIAG:
+      window_single_click_subscribe(BUTTON_ID_UP, prv_diag_to_hypno);
+      window_single_click_subscribe(BUTTON_ID_BACK, prv_diag_to_hypno);
       break;
     case MODE_HISTORY:
       window_single_click_subscribe(BUTTON_ID_UP, prv_hist_older);

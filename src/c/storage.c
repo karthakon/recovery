@@ -148,8 +148,13 @@ bool storage_night_read(uint8_t idx_from_newest, NightSummary *out) {
   prv_night_meta(&m);
   if (idx_from_newest >= m.night_count) return false;
   int slot = ((int)m.newest_slot - (int)idx_from_newest + MAX_NIGHTS) % MAX_NIGHTS;
+  // measurement-spec-v1 s3.5: accept BOTH sizes. A v1 record is 24 bytes
+  // shorter (no v_* / base_* tail). Zero the struct first so an absent tail
+  // reads as 0 and is distinguished by version, not by value.
+  memset(out, 0, sizeof(*out));
   int r = persist_read_data(KEY_NIGHT_BASE + slot, out, sizeof(*out));
-  if (r != (int)sizeof(*out)) return false;
-  if (out->version != NIGHT_SUMMARY_VERSION) return false;
+  if (r <= 0) return false;
+  if (r != (int)sizeof(*out) && r != (int)NIGHT_SUMMARY_V1_SIZE) return false;
+  if (out->version > NIGHT_SUMMARY_VERSION) return false;
   return true;
 }

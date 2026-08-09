@@ -14,7 +14,7 @@ typedef struct __attribute__((packed)) {
   uint8_t reserved;
 } EpochRecord;
 
-#define NIGHT_SUMMARY_VERSION 1
+#define NIGHT_SUMMARY_VERSION 2
 typedef struct __attribute__((packed)) {
   uint8_t version;  // NIGHT_SUMMARY_VERSION at save time; 0 = pre-versioning
   time_t date;
@@ -37,7 +37,22 @@ typedef struct __attribute__((packed)) {
   uint32_t night_var;     // NIGHT: sliding-window variance at stop
   uint8_t batt_start_pct; // battery % at record start (10% resolution)
   uint8_t batt_end_pct;   // battery % at record stop
+  // measurement-spec-v1 s3.5: appended at v2, never inserted.
+  // Absent on v<2 records - display as -- , never as 0.
+  uint32_t v_max;
+  uint32_t v_p90;
+  uint32_t v_median;
+  uint32_t base_min;
+  uint32_t base_max;
+  uint16_t v_count;
+  uint16_t v_over_gate_count;
 } NightSummary;
+
+// Size of a v1 record: the struct minus the 24-byte v2 tail
+// (5 x uint32_t + 2 x uint16_t). measurement-spec-v1 s3.5 requires
+// the read path to accept both sizes so v1 nights stay readable.
+#define NIGHT_SUMMARY_V2_TAIL_BYTES 24
+#define NIGHT_SUMMARY_V1_SIZE (sizeof(NightSummary) - NIGHT_SUMMARY_V2_TAIL_BYTES)
 
 void storage_session_start(void);
 void storage_epoch_write(const EpochRecord *rec);
