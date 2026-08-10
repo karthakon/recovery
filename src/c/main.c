@@ -845,13 +845,13 @@ static void prv_diag_to_hypno(ClickRecognizerRef r, void *ctx) {
   window_set_click_config_provider(s_window, prv_click_config);
   layer_mark_dirty(s_canvas);
 }
-static void prv_diag_to_runs(ClickRecognizerRef r, void *ctx) {
+static void prv_idle_to_runs(ClickRecognizerRef r, void *ctx) {
   s_mode = MODE_RUNS;
   window_set_click_config_provider(s_window, prv_click_config);
   layer_mark_dirty(s_canvas);
 }
-static void prv_runs_to_diag(ClickRecognizerRef r, void *ctx) {
-  s_mode = MODE_DIAG;
+static void prv_runs_to_idle(ClickRecognizerRef r, void *ctx) {
+  s_mode = MODE_IDLE;
   window_set_click_config_provider(s_window, prv_click_config);
   layer_mark_dirty(s_canvas);
 }
@@ -860,6 +860,7 @@ static void prv_click_config(void *ctx) {
     case MODE_IDLE:
       window_long_click_subscribe(BUTTON_ID_SELECT, 1500, prv_start_long, NULL);
       window_single_click_subscribe(BUTTON_ID_UP, prv_idle_to_history);
+      window_single_click_subscribe(BUTTON_ID_DOWN, prv_idle_to_runs);
       window_single_click_subscribe(BUTTON_ID_BACK, prv_idle_exit);
       break;
     case MODE_RECORDING:
@@ -878,12 +879,11 @@ static void prv_click_config(void *ctx) {
       break;
     case MODE_DIAG:
       window_single_click_subscribe(BUTTON_ID_UP, prv_diag_to_hypno);
-      window_single_click_subscribe(BUTTON_ID_DOWN, prv_diag_to_runs);
       window_single_click_subscribe(BUTTON_ID_BACK, prv_diag_to_hypno);
       break;
     case MODE_RUNS:
-      window_single_click_subscribe(BUTTON_ID_UP, prv_runs_to_diag);
-      window_single_click_subscribe(BUTTON_ID_BACK, prv_runs_to_diag);
+      window_single_click_subscribe(BUTTON_ID_UP, prv_runs_to_idle);
+      window_single_click_subscribe(BUTTON_ID_BACK, prv_runs_to_idle);
       break;
     case MODE_HISTORY:
       window_single_click_subscribe(BUTTON_ID_UP, prv_hist_older);
