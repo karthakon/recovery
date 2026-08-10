@@ -22,3 +22,10 @@ uint16_t hrv_rmssd(const HrvBuffer *b);
 uint16_t hrv_sdnn(const HrvBuffer *b);
 uint16_t hrv_mean_ppi(const HrvBuffer *b);
 uint32_t hrv_ppi_variance(const HrvBuffer *b);
+
+// classifier-spec-v1 s3.1: squared median absolute deviation of the buffer's
+// PPI values about their median. Robust per-minute dispersion; replaces
+// hrv_ppi_variance as the CLASSIFIER's per-minute feature. hrv_ppi_variance
+// is unchanged and still backs BASE over s_night_buf (base-spec-v1).
+// Returns 0 when count < 2. Integer only, no floats.
+uint32_t hrv_mad2(const HrvBuffer *b);
