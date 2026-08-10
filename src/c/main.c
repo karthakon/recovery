@@ -56,7 +56,7 @@ static uint16_t s_mins[4] = {0, 0, 0, 0};
 static uint8_t s_awake_streak = 0;
 static SleepStage s_last_stage = StageLight;
 static AppTimer *s_ui_timer = NULL;
-typedef enum { MODE_IDLE, MODE_RECORDING, MODE_RESULTS, MODE_HYPNO, MODE_HISTORY, MODE_DIAG } ScreenMode;
+typedef enum { MODE_IDLE, MODE_RECORDING, MODE_RESULTS, MODE_HYPNO, MODE_HISTORY, MODE_DIAG, MODE_RUNS } ScreenMode;
 static ScreenMode s_mode = MODE_IDLE;
 static uint8_t s_hist_idx = 0;      // 0 = newest
 static uint8_t s_hist_count = 0;    // populated nights at entry
@@ -628,12 +628,137 @@ static void prv_draw_diag(Layer *layer, GContext *ctx) {
     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 }
 
+// epoch-readout-spec-v1 s3: run-length statistics over the PRE-SMOOTHER
+// stage held in EpochRecord.reserved (smoother.c line 215 writes it there
+// before overwriting rec.stage). READ ONLY - storage_epoch_read only, never
+// storage_epoch_update. No EpochRecord change, no new static array.
+// s2 registered identity: rem_total MUST equal the night's v_over_gate_count.
+typedef struct {
+  uint16_t ep_n;
+  uint16_t rem_total;
+  uint16_t rem_runs;
+  uint16_t rem_max;
+  uint16_t r1, r2, r3, r4, r5p;
+  int16_t first_off;
+  bool has_off;
+} RunStats;
+
+// Onset by the SAME ONSET_RUN 5 consecutive non-Awake rule find_onset uses
+// (smoother.c lines 93-106), applied over reserved. -1 if none.
+#define RUNS_ONSET_RUN 5
+
+static void prv_compute_runs(RunStats *st) {
+  memset(st, 0, sizeof(*st));
+  st->first_off = 0;
+  st->has_off = false;
+  uint16_t n = storage_epoch_count();
+  st->ep_n = n;
+  if (n == 0) return;
+
+  int onset_idx = -1;
+  int first_rem = -1;
+  uint16_t onset_run = 0;
+  uint16_t cur_run = 0;
+
+  for (uint16_t t = 0; t < n; t++) {
+    EpochRecord rec;
+    if (!storage_epoch_read(t, &rec)) { continue; }
+    uint8_t st_pre = rec.reserved;
+
+    if (onset_idx < 0) {
+      if (st_pre != StageAwake) {
+        onset_run++;
+        if (onset_run >= RUNS_ONSET_RUN) {
+          onset_idx = (int)t - (RUNS_ONSET_RUN - 1);
+        }
+      } else {
+        onset_run = 0;
+      }
+    }
+
+    if (st_pre == StageREM) {
+      if (first_rem < 0) first_rem = (int)t;
+      st->rem_total++;
+      cur_run++;
+    } else if (cur_run > 0) {
+      st->rem_runs++;
+      if (cur_run > st->rem_max) st->rem_max = cur_run;
+      if (cur_run == 1) st->r1++;
+      else if (cur_run == 2) st->r2++;
+      else if (cur_run == 3) st->r3++;
+      else if (cur_run == 4) st->r4++;
+      else st->r5p++;
+      cur_run = 0;
+    }
+  }
+  if (cur_run > 0) {
+    st->rem_runs++;
+    if (cur_run > st->rem_max) st->rem_max = cur_run;
+    if (cur_run == 1) st->r1++;
+    else if (cur_run == 2) st->r2++;
+    else if (cur_run == 3) st->r3++;
+    else if (cur_run == 4) st->r4++;
+    else st->r5p++;
+  }
+
+  if (onset_idx >= 0 && first_rem >= 0) {
+    st->first_off = (int16_t)(first_rem - onset_idx);
+    st->has_off = true;
+  }
+}
+
+// epoch-readout-spec-v1 s4. Diagnostic-only screen, queued item 9.
+// An undefined value prints -- and NEVER 0.
+static void prv_draw_runs(Layer *layer, GContext *ctx) {
+  GRect b = layer_get_bounds(layer);
+  graphics_context_set_text_color(ctx, GColorBlack);
+  char line[64];
+  int y = 2;
+  GFont f = fonts_get_system_font(FONT_KEY_GOTHIC_14);
+  RunStats st;
+  prv_compute_runs(&st);
+
+  snprintf(line, sizeof(line), "Runs");
+  graphics_draw_text(ctx, line, fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
+    GRect(4, y, b.size.w - 8, 26), GTextOverflowModeTrailingEllipsis,
+    GTextAlignmentLeft, NULL); y += 26;
+
+  snprintf(line, sizeof(line), "RemN %u  Runs %u",
+    (unsigned)st.rem_total, (unsigned)st.rem_runs);
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+
+  snprintf(line, sizeof(line), "Max %u  Ep %u",
+    (unsigned)st.rem_max, (unsigned)st.ep_n);
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+
+  snprintf(line, sizeof(line), "L1 %u  L2 %u  L3 %u",
+    (unsigned)st.r1, (unsigned)st.r2, (unsigned)st.r3);
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+
+  snprintf(line, sizeof(line), "L4 %u  L5p %u",
+    (unsigned)st.r4, (unsigned)st.r5p);
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+
+  if (st.has_off) {
+    snprintf(line, sizeof(line), "Off %d", (int)st.first_off);
+  } else {
+    snprintf(line, sizeof(line), "Off --");
+  }
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+}
+
 static void prv_canvas_update(Layer *layer, GContext *ctx) {
   switch (s_mode) {
     case MODE_RECORDING: prv_draw_recording(layer, ctx); break;
     case MODE_RESULTS:   prv_draw_results(layer, ctx);   break;
     case MODE_HYPNO:     prv_draw_hypno(layer, ctx);     break;
     case MODE_DIAG:      prv_draw_diag(layer, ctx);      break;
+    case MODE_RUNS:      prv_draw_runs(layer, ctx);      break;
     case MODE_HISTORY:   prv_draw_history(layer, ctx);   break;
     case MODE_IDLE:
     default:             prv_draw_idle(layer, ctx);      break;
@@ -720,6 +845,16 @@ static void prv_diag_to_hypno(ClickRecognizerRef r, void *ctx) {
   window_set_click_config_provider(s_window, prv_click_config);
   layer_mark_dirty(s_canvas);
 }
+static void prv_diag_to_runs(ClickRecognizerRef r, void *ctx) {
+  s_mode = MODE_RUNS;
+  window_set_click_config_provider(s_window, prv_click_config);
+  layer_mark_dirty(s_canvas);
+}
+static void prv_runs_to_diag(ClickRecognizerRef r, void *ctx) {
+  s_mode = MODE_DIAG;
+  window_set_click_config_provider(s_window, prv_click_config);
+  layer_mark_dirty(s_canvas);
+}
 static void prv_click_config(void *ctx) {
   switch (s_mode) {
     case MODE_IDLE:
@@ -743,7 +878,12 @@ static void prv_click_config(void *ctx) {
       break;
     case MODE_DIAG:
       window_single_click_subscribe(BUTTON_ID_UP, prv_diag_to_hypno);
+      window_single_click_subscribe(BUTTON_ID_DOWN, prv_diag_to_runs);
       window_single_click_subscribe(BUTTON_ID_BACK, prv_diag_to_hypno);
+      break;
+    case MODE_RUNS:
+      window_single_click_subscribe(BUTTON_ID_UP, prv_runs_to_diag);
+      window_single_click_subscribe(BUTTON_ID_BACK, prv_runs_to_diag);
       break;
     case MODE_HISTORY:
       window_single_click_subscribe(BUTTON_ID_UP, prv_hist_older);
