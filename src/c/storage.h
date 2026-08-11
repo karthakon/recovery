@@ -14,7 +14,11 @@ typedef struct __attribute__((packed)) {
   uint8_t reserved;
 } EpochRecord;
 
-#define NIGHT_SUMMARY_VERSION 2
+#define NIGHT_SUMMARY_VERSION 3
+// nights-render-spec-v1 s2: bumped BY HAND in the same commit as any spec that
+// changes the classifier. 8 = classifier-spec-v2 (ed12fd7), the three-term
+// conjunction. 7 was classifier-spec-v1; N1-N16 were 6 and below.
+#define CLASSIFIER_SERIES 8
 typedef struct __attribute__((packed)) {
   uint8_t version;  // NIGHT_SUMMARY_VERSION at save time; 0 = pre-versioning
   time_t date;
@@ -46,13 +50,23 @@ typedef struct __attribute__((packed)) {
   uint32_t base_max;
   uint16_t v_count;
   uint16_t v_over_gate_count;
+  // nights-render-spec-v1 s2: appended at v3, never inserted.
+  // Absent on v<3 records - display as -- , never as 0.
+  uint8_t classifier_series;
 } NightSummary;
 
 // Size of a v1 record: the struct minus the 24-byte v2 tail
 // (5 x uint32_t + 2 x uint16_t). measurement-spec-v1 s3.5 requires
 // the read path to accept both sizes so v1 nights stay readable.
+// nights-render-spec-v1 s2: tails are CUMULATIVE from the current sizeof, so
+// each historical size stays numerically fixed as the struct grows. Defining
+// V1_SIZE against a bare 24 would have shifted it when v3 appended a byte and
+// silently rejected every v1 record.
+#define NIGHT_SUMMARY_V3_TAIL_BYTES 1
 #define NIGHT_SUMMARY_V2_TAIL_BYTES 24
-#define NIGHT_SUMMARY_V1_SIZE (sizeof(NightSummary) - NIGHT_SUMMARY_V2_TAIL_BYTES)
+#define NIGHT_SUMMARY_V2_SIZE (sizeof(NightSummary) - NIGHT_SUMMARY_V3_TAIL_BYTES)
+#define NIGHT_SUMMARY_V1_SIZE (sizeof(NightSummary) - NIGHT_SUMMARY_V3_TAIL_BYTES \
+                                                    - NIGHT_SUMMARY_V2_TAIL_BYTES)
 
 void storage_session_start(void);
 void storage_epoch_write(const EpochRecord *rec);

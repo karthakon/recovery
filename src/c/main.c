@@ -718,6 +718,44 @@ static void prv_draw_history(Layer *layer, GContext *ctx) {
   graphics_draw_text(ctx, line, fonts_get_system_font(FONT_KEY_GOTHIC_14),
     GRect(4, y, b.size.w - 8, 18), GTextOverflowModeWordWrap,
     GTextAlignmentLeft, NULL); y += 18;
+  // nights-render-spec-v1 s4. s3.1: absent fields print -- , NEVER 0, because
+  // a rendered 0 is indistinguishable from N16's genuine Gate 15 or N17's 77.
+  bool has_v = (s_hist_ns.version >= 2);
+  bool has_cs = (s_hist_ns.version >= 3);
+  if (has_v) {
+    snprintf(line, sizeof(line), "Vmax %lu  P90 %lu",
+      (unsigned long)s_hist_ns.v_max, (unsigned long)s_hist_ns.v_p90);
+  } else {
+    snprintf(line, sizeof(line), "Vmax --  P90 --");
+  }
+  graphics_draw_text(ctx, line, fonts_get_system_font(FONT_KEY_GOTHIC_14),
+    GRect(4, y, b.size.w - 8, 18), GTextOverflowModeWordWrap,
+    GTextAlignmentLeft, NULL); y += 18;
+  if (has_v) {
+    snprintf(line, sizeof(line), "Vmed %lu  Vn %u  Gate %u",
+      (unsigned long)s_hist_ns.v_median, s_hist_ns.v_count,
+      s_hist_ns.v_over_gate_count);
+  } else {
+    snprintf(line, sizeof(line), "Vmed --  Vn --  Gate --");
+  }
+  graphics_draw_text(ctx, line, fonts_get_system_font(FONT_KEY_GOTHIC_14),
+    GRect(4, y, b.size.w - 8, 18), GTextOverflowModeWordWrap,
+    GTextAlignmentLeft, NULL); y += 18;
+  // s3.2: the series byte is what makes the numbers above interpretable --
+  // the v_* fields changed meaning at classifier_series 7 (443f499).
+  if (has_v && has_cs) {
+    snprintf(line, sizeof(line), "Bmin %lu  Bmax %lu  cs%u",
+      (unsigned long)s_hist_ns.base_min, (unsigned long)s_hist_ns.base_max,
+      s_hist_ns.classifier_series);
+  } else if (has_v) {
+    snprintf(line, sizeof(line), "Bmin %lu  Bmax %lu  cs--",
+      (unsigned long)s_hist_ns.base_min, (unsigned long)s_hist_ns.base_max);
+  } else {
+    snprintf(line, sizeof(line), "Bmin --  Bmax --  cs--");
+  }
+  graphics_draw_text(ctx, line, fonts_get_system_font(FONT_KEY_GOTHIC_14),
+    GRect(4, y, b.size.w - 8, 18), GTextOverflowModeWordWrap,
+    GTextAlignmentLeft, NULL); y += 18;
 
   graphics_draw_text(ctx, "UP older  DOWN newer",
     fonts_get_system_font(FONT_KEY_GOTHIC_14),

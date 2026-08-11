@@ -79,6 +79,7 @@ void storage_night_save(const NightSummary *ns) {
   }
   NightSummary stamped = *ns;
   stamped.version = NIGHT_SUMMARY_VERSION;
+  stamped.classifier_series = CLASSIFIER_SERIES;   // nights-render-spec-v1 s2
   persist_write_data(KEY_NIGHT_BASE + slot, &stamped, sizeof(stamped));
   m.newest_slot = slot;
   if (m.night_count < MAX_NIGHTS) m.night_count++;
@@ -154,7 +155,12 @@ bool storage_night_read(uint8_t idx_from_newest, NightSummary *out) {
   memset(out, 0, sizeof(*out));
   int r = persist_read_data(KEY_NIGHT_BASE + slot, out, sizeof(*out));
   if (r <= 0) return false;
-  if (r != (int)sizeof(*out) && r != (int)NIGHT_SUMMARY_V1_SIZE) return false;
+  // nights-render-spec-v1 s2: accept THREE sizes. The cc305dd both-sizes path
+  // is extended, never replaced. Absent tails read as 0 from the memset above
+  // and are distinguished by version, not by value.
+  if (r != (int)sizeof(*out) &&
+      r != (int)NIGHT_SUMMARY_V2_SIZE &&
+      r != (int)NIGHT_SUMMARY_V1_SIZE) return false;
   if (out->version > NIGHT_SUMMARY_VERSION) return false;
   return true;
 }
