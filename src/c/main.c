@@ -46,6 +46,10 @@ static uint8_t s_base_sample_count = 0;
 static uint32_t s_base_next_mark = 0;
 static uint32_t s_epoch_var[EPOCH_VAR_MAX];
 static uint16_t s_epoch_var_count = 0;
+// classifier-spec-v2 s3.5 as corrected: S(m), RAM-only stillness bitmap,
+// index-parallel to s_epoch_var. EpochRecord.reserved is NOT touched -- it
+// holds the pre-smoother stage that RUNS reads.
+static uint8_t s_epoch_still[(EPOCH_VAR_MAX + 7) / 8];
 static uint32_t s_stop_night_var = 0;
 static uint8_t s_batt_start = 0;
 static uint8_t s_batt_end = 0;
@@ -134,6 +138,12 @@ static void prv_close_minute(void) {
     // classifier-spec-v1 s3.1: D(m), robust per-minute dispersion. Replaces
     // hrv_ppi_variance HERE ONLY. The s_night_buf call below is BASE and is
     // unchanged (base-spec-v1, classifier-spec s2 as corrected).
+    // classifier-spec-v2 s3.5: set the stillness bit for THIS index before
+    // the count advances. Cleared for the whole array at session start.
+    if (!movement) {
+      s_epoch_still[s_epoch_var_count >> 3] |=
+        (uint8_t)(1 << (s_epoch_var_count & 7));
+    }
     s_epoch_var[s_epoch_var_count++] = hrv_mad2(&s_minute_buf);
   }
   if (s_onset_marked && s_base_sample_count < BASE_SAMPLE_MAX) {
@@ -197,6 +207,7 @@ static void prv_start_recording(void) {
   s_session_start = time(NULL);
   s_night_baseline_var = 0;
   s_epoch_var_count = 0;
+  memset(s_epoch_still, 0, sizeof(s_epoch_still));   // classifier-spec-v2 s3.5
   s_base_sample_count = 0;
   s_base_next_mark = 0;
   s_stop_night_var = 0;
@@ -238,6 +249,9 @@ static uint32_t s_epoch_f[EPOCH_VAR_MAX];
 // Sort scratch for the anchor median. Separate array so s_epoch_f keeps its
 // epoch indexing for the re-decision pass that follows.
 static uint32_t s_anchor_scratch[EPOCH_VAR_MAX];
+// classifier-spec-v2 s3.3: HF(m), the windowed per-minute heart rate.
+// uint16_t is sufficient for bpm and halves the BSS cost (s5.4).
+static uint16_t s_epoch_hf[EPOCH_VAR_MAX];
 
 static void prv_measure(uint32_t base_final) {
   s_v_max = 0; s_v_p90 = 0; s_v_median = 0;
@@ -317,13 +331,63 @@ static uint32_t prv_window_median(uint16_t m, uint16_t n) {
   return w[k / 2];                            // upper-middle, no averaging
 }
 
+// classifier-spec-v2 s3.2/s3.3: HF(m) = median of H over the centred window
+// m-2 .. m+2, missing excluded, truncated at edges. H(m) = 60000 / mean_ppi,
+// read from EpochRecord at stop -- NOT s_last_hr, which is not persisted.
+// Identical window shape to prv_window_median so both terms share support.
+static uint16_t prv_window_median_hr(uint16_t m, uint16_t n) {
+  uint16_t w[5];
+  uint16_t k = 0;
+  uint16_t lo = (m >= 2) ? (m - 2) : 0;
+  uint16_t hi = (m + 2 < n) ? (m + 2) : (n - 1);
+  for (uint16_t i = lo; i <= hi; i++) {
+    EpochRecord rec;
+    if (!storage_epoch_read(i, &rec)) continue;
+    if (rec.mean_ppi == 0) continue;                 // s3.2: missing, excluded
+    uint16_t key = (uint16_t)(60000UL / rec.mean_ppi);
+    if (key == 0) continue;
+    uint16_t j = k;
+    while (j > 0 && w[j - 1] > key) { w[j] = w[j - 1]; j--; }
+    w[j] = key;
+    k++;
+  }
+  if (k == 0) return 0;
+  return w[k / 2];                            // upper-middle, no averaging
+}
 // classifier-spec-v1 s3.3: A, the median of F over all non-Awake minutes with
 // F defined. Fills s_epoch_f as it goes. Returns 0 if no minute qualifies.
-static uint32_t prv_compute_anchor(void) {
+static uint32_t prv_compute_anchor(uint16_t *out_anchor_hr) {
   uint16_t n = storage_epoch_count();
   if (n > s_epoch_var_count) n = s_epoch_var_count;
+  if (out_anchor_hr) *out_anchor_hr = 0;
   if (n == 0) return 0;
   for (uint16_t i = 0; i < n; i++) s_epoch_f[i] = prv_window_median(i, n);
+  // classifier-spec-v2 s3.3: fill HF alongside F, same pass, same window.
+  for (uint16_t i = 0; i < n; i++) s_epoch_hf[i] = prv_window_median_hr(i, n);
+  // classifier-spec-v2 s3.4: A_H = median of HF over non-Awake minutes with
+  // HF defined. Computed FIRST, before A_D reuses s_anchor_scratch below.
+  if (out_anchor_hr) {
+    uint16_t hk = 0;
+    for (uint16_t i = 0; i < n; i++) {
+      EpochRecord rec;
+      if (!storage_epoch_read(i, &rec)) continue;
+      if (rec.stage == (uint8_t)StageAwake) continue;
+      if (s_epoch_hf[i] == 0) continue;
+      s_anchor_scratch[hk++] = (uint32_t)s_epoch_hf[i];
+    }
+    if (hk > 0) {
+      for (uint16_t i = 1; i < hk; i++) {
+        uint32_t key = s_anchor_scratch[i];
+        uint16_t j = i;
+        while (j > 0 && s_anchor_scratch[j - 1] > key) {
+          s_anchor_scratch[j] = s_anchor_scratch[j - 1];
+          j--;
+        }
+        s_anchor_scratch[j] = key;
+      }
+      *out_anchor_hr = (uint16_t)s_anchor_scratch[hk / 2];
+    }
+  }
   // Collect the qualifying F values into the scratch array, then sort it.
   uint16_t k = 0;
   for (uint16_t i = 0; i < n; i++) {
@@ -347,7 +411,7 @@ static uint32_t prv_compute_anchor(void) {
 }
 
 // Awake is untouched (s2) and runs before smoother_run (s3.5).
-static void prv_base_redecide(uint32_t anchor) {
+static void prv_base_redecide(uint32_t anchor, uint16_t anchor_hr) {
   if (anchor == 0) return;
   uint16_t n = storage_epoch_count();
   if (n > s_epoch_var_count) n = s_epoch_var_count;
@@ -361,9 +425,14 @@ static void prv_base_redecide(uint32_t anchor) {
     SleepStage ns_stage;
     // classifier-spec-v1 s3.4. Multipliers unchanged; the anchor is A, not
     // BASE (D1, and scope-correction s2).
+    // classifier-spec-v2 s4: REM is the conjunction of all three terms.
+    // T2 is a median split on the night's own HF distribution; T3 is the
+    // atonia veto, read from the RAM-only bitmap (s3.5 as corrected).
+    bool t2 = (anchor_hr > 0) && (s_epoch_hf[i] > anchor_hr);
+    bool t3 = (s_epoch_still[i >> 3] & (uint8_t)(1 << (i & 7))) != 0;
     if (v * 2 >= anchor && v <= anchor * 2) {
       ns_stage = StageLight;
-    } else if (v > anchor * 2) {
+    } else if (v > anchor * 2 && t2 && t3) {
       ns_stage = StageREM;
     } else {
       ns_stage = StageLight;
@@ -379,8 +448,9 @@ static void prv_base_redecide(uint32_t anchor) {
 static void prv_stop_recording(void) {
   prv_close_minute();
   s_night_baseline_var = prv_base_median();   // s3.3 whole-night BASE
-  uint32_t anchor = prv_compute_anchor();      // classifier-spec-v1 s3.3
-  prv_base_redecide(anchor);                   // s3.4, before the smoother
+  uint16_t anchor_hr = 0;                      // classifier-spec-v2 s3.4
+  uint32_t anchor = prv_compute_anchor(&anchor_hr);
+  prv_base_redecide(anchor, anchor_hr);        // s3.4, before the smoother
   prv_measure(anchor);                         // measurement-spec correction s2
   smoother_run(s_mins);
   s_recording = false;
