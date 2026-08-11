@@ -860,6 +860,12 @@ static void prv_hypno_back_to_results(ClickRecognizerRef r, void *ctx) {
   window_set_click_config_provider(s_window, prv_click_config);
   layer_mark_dirty(s_canvas);
 }
+static void prv_idle_to_results(ClickRecognizerRef r, void *ctx) {
+  if (s_recording) return;
+  s_mode = MODE_RESULTS;
+  window_set_click_config_provider(s_window, prv_click_config);
+  layer_mark_dirty(s_canvas);
+}
 static void prv_results_to_idle(ClickRecognizerRef r, void *ctx) {
   s_mode = MODE_IDLE;
   window_set_click_config_provider(s_window, prv_click_config);
@@ -932,6 +938,7 @@ static void prv_click_config(void *ctx) {
   switch (s_mode) {
     case MODE_IDLE:
       window_long_click_subscribe(BUTTON_ID_SELECT, 1500, prv_start_long, NULL);
+      window_single_click_subscribe(BUTTON_ID_SELECT, prv_idle_to_results);
       window_single_click_subscribe(BUTTON_ID_UP, prv_idle_to_history);
       window_single_click_subscribe(BUTTON_ID_DOWN, prv_idle_to_runs);
       window_single_click_subscribe(BUTTON_ID_BACK, prv_idle_exit);
