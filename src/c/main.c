@@ -946,6 +946,11 @@ typedef struct {
   uint16_t r1, r2, r3, r4, r5p;
   int16_t first_off;
   bool has_off;
+  // classifier-spec-v3 s3.4: the LABEL-derived onset Off is measured
+  // against. Under v3 this is NOT the same quantity as the live
+  // immobility onset s_onset_epoch_idx -- both are rendered so the
+  // divergence is observable. -1 when no onset was found.
+  int16_t onset_label;
 } RunStats;
 
 // Onset by the SAME ONSET_RUN 5 consecutive non-Awake rule find_onset uses
@@ -956,6 +961,7 @@ static void prv_compute_runs(RunStats *st) {
   memset(st, 0, sizeof(*st));
   st->first_off = 0;
   st->has_off = false;
+  st->onset_label = -1;
   uint16_t n = storage_epoch_count();
   st->ep_n = n;
   if (n == 0) return;
@@ -1006,6 +1012,7 @@ static void prv_compute_runs(RunStats *st) {
     else st->r5p++;
   }
 
+  if (onset_idx >= 0) st->onset_label = (int16_t)onset_idx;
   if (onset_idx >= 0 && first_rem >= 0) {
     st->first_off = (int16_t)(first_rem - onset_idx);
     st->has_off = true;
@@ -1052,6 +1059,20 @@ static void prv_draw_runs(Layer *layer, GContext *ctx) {
     snprintf(line, sizeof(line), "Off %d", (int)st.first_off);
   } else {
     snprintf(line, sizeof(line), "Off --");
+  }
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+
+  // classifier-spec-v3 s3.4. Ons  = live immobility onset epoch index.
+  // OnsL = label-derived onset, the one Off is measured against. They were
+  // the same quantity before v3. An undefined value prints -- and NEVER 0.
+  {
+    char a1[12], a2[12];
+    if (s_onset_epoch_idx >= 0) snprintf(a1, sizeof(a1), "%d", (int)s_onset_epoch_idx);
+    else snprintf(a1, sizeof(a1), "--");
+    if (st.onset_label >= 0) snprintf(a2, sizeof(a2), "%d", (int)st.onset_label);
+    else snprintf(a2, sizeof(a2), "--");
+    snprintf(line, sizeof(line), "Ons %s  OnsL %s", a1, a2);
   }
   graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
