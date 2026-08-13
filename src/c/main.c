@@ -29,6 +29,11 @@ static void prv_accel_peek(void) {
 }
 static uint16_t s_last_ppi = 0;
 static uint16_t s_last_hr = 0;
+// classifier-spec-v3 s3.2: s_last_hr is never cleared (assigned only when
+// hr > 0), so a presence test passes forever on a stale value. FROZEN at 180 s
+// on a measured HR event rate of ~59.7/min. Gates ns.mean_hr and nothing else.
+#define HR_STALE_SEC 180
+static uint32_t s_last_hr_time = 0;
 static HrvBuffer s_live_buf;
 static HrvBuffer s_minute_buf;
 static HrvBuffer s_night_buf;
@@ -36,6 +41,13 @@ static HrvBuffer s_night_buf;
 static uint16_t s_sleep_streak;
 static uint32_t s_onset_mark;
 static bool s_onset_marked;
+// classifier-spec-v3 s3.5/s4.2. A_MIN_MINUTES carried from the existing
+// s_night_hr_count >= 20. AW_MOVED_MIN is an UNWEIGHTED 3-of-5 majority.
+#define A_MIN_MINUTES 20
+#define AW_MOVED_MIN 3
+// s_onset_mark is s_night_buf.total_accepted -- a BEAT count. s3.5 needs the
+// EPOCH index at onset, which no existing static carries. -1 until onset marks.
+static int32_t s_onset_epoch_idx = -1;
 static time_t s_session_start = 0;
 static uint32_t s_night_baseline_var = 0;
 #define BASE_SAMPLE_MAX 160   // safety bound, not a modelling parameter (base-spec-v1 s3.1)
@@ -50,12 +62,16 @@ static uint16_t s_epoch_var_count = 0;
 // index-parallel to s_epoch_var. EpochRecord.reserved is NOT touched -- it
 // holds the pre-smoother stage that RUNS reads.
 static uint8_t s_epoch_still[(EPOCH_VAR_MAX + 7) / 8];
+// classifier-spec-v3 s3.1: movement is THREE-VALUED. s_epoch_still carries
+// !movement exactly as 2401455 s3 defines it and is NOT redefined here; this
+// second RAM-only bitmap carries whether the minute had ANY accel sample.
+// STILL = still && known.  UNKNOWN = still && !known.  UNKNOWN is NEVER STILL.
+static uint8_t s_epoch_mv_known[(EPOCH_VAR_MAX + 7) / 8];
 static uint32_t s_stop_night_var = 0;
 static uint8_t s_batt_start = 0;
 static uint8_t s_batt_end = 0;
 static uint32_t s_night_hr_sum = 0;
 static uint16_t s_night_hr_count = 0;
-static uint16_t s_night_baseline_hr = 0;
 static uint16_t s_mins[4] = {0, 0, 0, 0};
 static uint8_t s_awake_streak = 0;
 static SleepStage s_last_stage = StageLight;
@@ -95,9 +111,16 @@ static uint32_t prv_base_median(void) {
 
 static void prv_close_minute(void) {
   if (!s_recording) return;
-  if (s_last_hr > 0) {
-    s_night_hr_sum += s_last_hr;
-    s_night_hr_count++;
+  // classifier-spec-v3 s3.2/s3.3: accumulate ONLY when fresh. s_last_hr is
+  // never cleared, so a bare > 0 test passes forever on a stale value.
+  {
+    uint32_t now = (uint32_t)time(NULL);
+    bool hr_fresh = (s_last_hr > 0) && (s_last_hr_time > 0) &&
+                    ((now - s_last_hr_time) <= HR_STALE_SEC);
+    if (hr_fresh) {
+      s_night_hr_sum += s_last_hr;
+      s_night_hr_count++;
+    }
   }
   EpochRecord rec;
   uint16_t total = s_minute_buf.count + (uint16_t)s_minute_buf.rejected;
@@ -106,12 +129,15 @@ static void prv_close_minute(void) {
   rec.beat_count = (s_minute_buf.count > 255) ? 255 : (uint8_t)s_minute_buf.count;
   rec.quality_pct = (total > 0) ? (uint8_t)((s_minute_buf.count * 100) / total) : 0;
   rec.reserved = 0;
-  bool movement = (s_mv_min_samples > 0) &&
+  // classifier-spec-v3 s3.1: three-valued. MOVED and STILL both require a
+  // sample; no samples is UNKNOWN, which is NEVER folded into STILL.
+  bool mv_known = (s_mv_min_samples > 0);
+  bool movement = mv_known &&
     ((uint32_t)s_mv_min_moved * 100 >=
      (uint32_t)s_mv_min_samples * MV_MOVED_PCT);
+  MovementState mv = !mv_known ? MV_UNKNOWN : (movement ? MV_MOVED : MV_STILL);
   SleepStage st = sleep_stage_classify(&s_minute_buf, s_night_baseline_var,
-                                       s_last_hr, s_night_baseline_hr,
-                                       movement);
+                                       mv);
   s_mv_min_samples = 0;
   s_mv_min_moved = 0;
   if (st == StageAwake) {
@@ -121,10 +147,17 @@ static void prv_close_minute(void) {
     s_awake_streak = 0;
   }
   s_last_stage = st;
-  if (st == StageAwake) {
+  // classifier-spec-v3 s3.4: onset is IMMOBILITY-based, on accelerometer data
+  // ALONE -- it reads no stage label, no mask, no HR, no HRV, no stored night.
+  // MOVED resets the streak and UNKNOWN resets it too: a run interrupted by
+  // minutes carrying no evidence is not five consecutive immobile minutes.
+  if (mv != MV_STILL) {
     s_sleep_streak = 0;
   } else if (!s_onset_marked && ++s_sleep_streak >= SLEEP_ONSET_MINUTES) {
     s_onset_mark = s_night_buf.total_accepted;
+    // s3.5 needs the EPOCH index at onset. s_onset_mark is a BEAT count and
+    // cannot serve. This minute's epoch index is the pre-increment count.
+    s_onset_epoch_idx = (int32_t)s_epoch_var_count;
     s_onset_marked = true;
     s_night_hr_sum = 0;
     s_night_hr_count = 0;
@@ -144,6 +177,12 @@ static void prv_close_minute(void) {
       s_epoch_still[s_epoch_var_count >> 3] |=
         (uint8_t)(1 << (s_epoch_var_count & 7));
     }
+    // classifier-spec-v3 s3.1: the parallel known-bit. s_epoch_still is
+    // UNCHANGED in meaning (2401455 s3); STILL = still && known at read time.
+    if (mv_known) {
+      s_epoch_mv_known[s_epoch_var_count >> 3] |=
+        (uint8_t)(1 << (s_epoch_var_count & 7));
+    }
     s_epoch_var[s_epoch_var_count++] = hrv_mad2(&s_minute_buf);
   }
   if (s_onset_marked && s_base_sample_count < BASE_SAMPLE_MAX) {
@@ -160,9 +199,6 @@ static void prv_close_minute(void) {
       }
     }
   }
-  if (s_onset_marked && s_night_hr_count >= 20 && s_night_baseline_hr == 0) {
-    s_night_baseline_hr = (uint16_t)(s_night_hr_sum / s_night_hr_count);
-  }
   hrv_buf_reset(&s_minute_buf);
 }
 
@@ -177,7 +213,12 @@ static void prv_health_handler(HealthEventType event, void *context) {
   if (event == HealthEventHeartRateUpdate) {
     s_hr_events++;
     HealthValue hr = health_service_peek_current_value(HealthMetricHeartRateRawBPM);
-    if (hr > 0) s_last_hr = (uint16_t)hr;
+    // classifier-spec-v3 s3.2: stamp the assignment so freshness is testable
+    // at minute close. Same branch, same condition -- never assigned apart.
+    if (hr > 0) {
+      s_last_hr = (uint16_t)hr;
+      s_last_hr_time = (uint32_t)time(NULL);
+    }
   } else if ((int)event == 5) {
     s_hrv_events++;
     uint16_t ppi = (uint16_t)health_service_peek_hrv_ppi_ms();
@@ -208,6 +249,7 @@ static void prv_start_recording(void) {
   s_night_baseline_var = 0;
   s_epoch_var_count = 0;
   memset(s_epoch_still, 0, sizeof(s_epoch_still));   // classifier-spec-v2 s3.5
+  memset(s_epoch_mv_known, 0, sizeof(s_epoch_mv_known)); // c-spec-v3 s3.1
   s_base_sample_count = 0;
   s_base_next_mark = 0;
   s_stop_night_var = 0;
@@ -215,7 +257,7 @@ static void prv_start_recording(void) {
   s_batt_end = 0;
   s_night_hr_sum = 0;
   s_night_hr_count = 0;
-  s_night_baseline_hr = 0;
+  s_last_hr_time = 0;                                // c-spec-v3 s3.2
   s_mv_min_samples = 0;
   s_mv_min_moved = 0;
   s_awake_streak = 0;
@@ -226,6 +268,7 @@ static void prv_start_recording(void) {
   s_sleep_streak = 0;
   s_onset_mark = 0;
   s_onset_marked = false;
+  s_onset_epoch_idx = -1;                            // c-spec-v3 s3.5
   storage_session_start();
   s_mode = MODE_RECORDING;
   window_set_click_config_provider(s_window, prv_click_config);
@@ -354,6 +397,84 @@ static uint16_t prv_window_median_hr(uint16_t m, uint16_t n) {
   if (k == 0) return 0;
   return w[k / 2];                            // upper-middle, no averaging
 }
+// classifier-spec-v3 s3.5/s3.6/s4.2: the Awake re-decision pass. Runs BEFORE
+// prv_compute_anchor (s5 step 3 before step 4) -- that single ordering is the
+// whole mechanism, so anchors are computed over a CORRECTED label set.
+// This is the ONLY pass that writes StageAwake.
+static void prv_awake_redecide(void) {
+  uint16_t n = storage_epoch_count();
+  if (n > s_epoch_var_count) n = s_epoch_var_count;
+  if (n == 0) return;
+
+  // s3.3: HF(m), same window shape as F(m). prv_compute_anchor refills
+  // s_epoch_hf identically before it uses it, so filling it here is safe.
+  for (uint16_t i = 0; i < n; i++) s_epoch_hf[i] = prv_window_median_hr(i, n);
+
+  // s3.5: A = median of HF over minutes at or after the ONSET index with HF
+  // defined and movement STILL. STILL = still && known -- UNKNOWN is never
+  // STILL (s3.1). A filters on accelerometer evidence, NOT on Awake labels,
+  // which is what keeps it non-circular with the decision it feeds.
+  uint32_t a_hr = 0;
+  if (s_onset_epoch_idx >= 0) {
+    uint16_t k = 0;
+    for (uint16_t i = (uint16_t)s_onset_epoch_idx; i < n; i++) {
+      bool still = (s_epoch_still[i >> 3] & (uint8_t)(1 << (i & 7))) != 0;
+      bool known = (s_epoch_mv_known[i >> 3] & (uint8_t)(1 << (i & 7))) != 0;
+      if (!(still && known)) continue;
+      if (s_epoch_hf[i] == 0) continue;
+      s_anchor_scratch[k++] = (uint32_t)s_epoch_hf[i];
+    }
+    // s3.5: fewer than A_MIN_MINUTES qualifying minutes leaves A undefined.
+    if (k >= A_MIN_MINUTES) {
+      for (uint16_t i = 1; i < k; i++) {
+        uint32_t key = s_anchor_scratch[i];
+        uint16_t j = i;
+        while (j > 0 && s_anchor_scratch[j - 1] > key) {
+          s_anchor_scratch[j] = s_anchor_scratch[j - 1];
+          j--;
+        }
+        s_anchor_scratch[j] = key;
+      }
+      a_hr = s_anchor_scratch[k / 2];        // upper-middle, no averaging
+    }
+  }
+
+  for (uint16_t i = 0; i < n; i++) {
+    EpochRecord rec;
+    if (!storage_epoch_read(i, &rec)) continue;
+
+    // s3.6: AW(m) over the centred window i-2 .. i+2, truncated at edges,
+    // missing excluded. Same window shape as F(m) and HF(m), so no term in
+    // the project fires on a single isolated minute.
+    uint16_t lo = (i >= 2) ? (i - 2) : 0;
+    uint16_t hi = (i + 2 < n) ? (i + 2) : (n - 1);
+    uint16_t moved = 0;
+    for (uint16_t w = lo; w <= hi; w++) {
+      bool still = (s_epoch_still[w >> 3] & (uint8_t)(1 << (w & 7))) != 0;
+      bool known = (s_epoch_mv_known[w >> 3] & (uint8_t)(1 << (w & 7))) != 0;
+      if (known && !still) moved++;          // MOVED only; UNKNOWN is not MOVED
+    }
+    // s4.2 clause 1: unweighted majority, AW_MOVED_MIN of 5.
+    bool c1 = (moved >= AW_MOVED_MIN);
+    // s4.2 clause 2: A defined, HF defined, HF(m) * 100 > A * 103. The 103 is
+    // carried from sleep_stage.c's 97; its REFERENCE is not carried. When A is
+    // undefined no minute is scored Awake by the HR term -- a missing baseline
+    // must never make Awake EASIER to declare.
+    bool c2 = (a_hr > 0) && (s_epoch_hf[i] > 0) &&
+              ((uint32_t)s_epoch_hf[i] * 100 > a_hr * 103);
+
+    SleepStage ns_stage = (c1 || c2) ? StageAwake : StageLight;
+    // Clearing goes to Light so the minute becomes eligible for step 5's
+    // Light/REM decision, which skips StageAwake (bae23c3 s2, unchanged).
+    if (!(c1 || c2) && rec.stage != (uint8_t)StageAwake) continue;
+    if ((uint8_t)ns_stage == rec.stage) continue;
+    if (s_mins[rec.stage] > 0) s_mins[rec.stage]--;
+    s_mins[ns_stage]++;
+    rec.stage = (uint8_t)ns_stage;
+    storage_epoch_update(i, &rec);
+  }
+}
+
 // classifier-spec-v1 s3.3: A, the median of F over all non-Awake minutes with
 // F defined. Fills s_epoch_f as it goes. Returns 0 if no minute qualifies.
 static uint32_t prv_compute_anchor(uint16_t *out_anchor_hr) {
@@ -448,6 +569,9 @@ static void prv_base_redecide(uint32_t anchor, uint16_t anchor_hr) {
 static void prv_stop_recording(void) {
   prv_close_minute();
   s_night_baseline_var = prv_base_median();   // s3.3 whole-night BASE
+  // classifier-spec-v3 s5 step 3: MUST run before prv_compute_anchor so the
+  // anchors are medians over a corrected label set. This is the whole point.
+  prv_awake_redecide();
   uint16_t anchor_hr = 0;                      // classifier-spec-v2 s3.4
   uint32_t anchor = prv_compute_anchor(&anchor_hr);
   prv_base_redecide(anchor, anchor_hr);        // s3.4, before the smoother
@@ -1105,6 +1229,7 @@ static void prv_init(void) {
   s_sleep_streak = 0;
   s_onset_mark = 0;
   s_onset_marked = false;
+  s_onset_epoch_idx = -1;                            // c-spec-v3 s3.5
   s_base_sample_count = 0;
   s_base_next_mark = 0;
   health_service_events_subscribe(prv_health_handler, NULL);

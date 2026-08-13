@@ -25,7 +25,10 @@ uint32_t hrv_ppi_variance(const HrvBuffer *b);
 
 // classifier-spec-v1 s3.1: squared median absolute deviation of the buffer's
 // PPI values about their median. Robust per-minute dispersion; replaces
-// hrv_ppi_variance as the CLASSIFIER's per-minute feature. hrv_ppi_variance
-// is unchanged and still backs BASE over s_night_buf (base-spec-v1).
+// hrv_ppi_variance in the STOP-TIME RE-DECISION PASS ONLY (prv_base_redecide).
+// classifier-spec-v3 s4.1: the LIVE classifier (sleep_stage.c) still calls
+// hrv_ppi_variance against night_baseline_variance -- that statistic is
+// deliberately NOT changed here. hrv_ppi_variance is also unchanged as the
+// backing for BASE over s_night_buf (base-spec-v1).
 // Returns 0 when count < 2. Integer only, no floats.
 uint32_t hrv_mad2(const HrvBuffer *b);
