@@ -58,6 +58,16 @@ static uint32_t s_night_baseline_var = 0;
 static uint16_t s_anchor_hr = 0;
 static uint16_t s_anchor_hr_n = 0;
 static uint32_t s_anchor_d = 0;
+// classifier-spec-v2 s4: among minutes that clear T1 (v > 2*A_D), which of the
+// other two terms vetoed. A complete partition of the T1-admitted set AS
+// prv_base_redecide SEES IT -- NOT guaranteed to sum to Gate, because prv_measure
+// re-reads rec.stage after the re-decision rewrote it and the two Awake skips
+// therefore filter different sets. P-SUB measures Gate minus RemN but CANNOT say
+// which term subtracted; no instrument separated them before this. RAM-only.
+static uint16_t s_veto_t2 = 0;    // cleared T1, failed T2 only
+static uint16_t s_veto_t3 = 0;    // cleared T1, failed T3 only
+static uint16_t s_veto_both = 0;  // cleared T1, failed both
+static uint16_t s_veto_none = 0;  // cleared T1, passed both -- became REM
 #define BASE_SAMPLE_MAX 160   // safety bound, not a modelling parameter (base-spec-v1 s3.1)
 #define EPOCH_VAR_MAX 960     // 16 h of per-minute variance, RAM only (base-spec-v1 s4)
 #define BASE_SAMPLE_MIN 3
@@ -258,6 +268,7 @@ static void prv_start_recording(void) {
   s_epoch_var_count = 0;
   memset(s_epoch_still, 0, sizeof(s_epoch_still));   // classifier-spec-v2 s3.5
   memset(s_epoch_mv_known, 0, sizeof(s_epoch_mv_known)); // c-spec-v3 s3.1
+  s_veto_t2 = s_veto_t3 = s_veto_both = s_veto_none = 0;
   s_base_sample_count = 0;
   s_base_next_mark = 0;
   s_stop_night_var = 0;
@@ -560,13 +571,28 @@ static void prv_base_redecide(uint32_t anchor, uint16_t anchor_hr) {
     // T2 is a median split on the night's own HF distribution; T3 is the
     // atonia veto, read from the RAM-only bitmap (s3.5 as corrected).
     bool t2 = (anchor_hr > 0) && (s_epoch_hf[i] > anchor_hr);
-    bool t3 = (s_epoch_still[i >> 3] & (uint8_t)(1 << (i & 7))) != 0;
+    // classifier-spec-v3 s3.1: UNKNOWN is NEVER treated as STILL. s_epoch_still
+    // is set whenever !movement, which includes minutes with NO accel samples
+    // (prv_accel_peek runs only inside prv_health_handler), so the known-bit is
+    // required at read time -- the contract main.c 188-189 states and which the
+    // Awake path already honours at 429-430 and 461-462. T3 read stillness alone
+    // here, so a sensor gap passed the atonia veto. classifier-spec-v2 s4.3's
+    // intact-atonia assumption is unchanged; this makes the veto mean what it says.
+    bool t3 = ((s_epoch_still[i >> 3] & (uint8_t)(1 << (i & 7))) != 0)
+           && ((s_epoch_mv_known[i >> 3] & (uint8_t)(1 << (i & 7))) != 0);
     if (v * 2 >= anchor && v <= anchor * 2) {
       ns_stage = StageLight;
     } else if (v > anchor * 2 && t2 && t3) {
       ns_stage = StageREM;
     } else {
       ns_stage = StageLight;
+    }
+    // Tally AFTER the decision, over T1-admitted minutes only. Counting, not deciding.
+    if (v > anchor * 2) {
+      if (t2 && t3)       s_veto_none++;
+      else if (!t2 && !t3) s_veto_both++;
+      else if (!t2)        s_veto_t2++;
+      else                 s_veto_t3++;
     }
     if ((uint8_t)ns_stage == rec.stage) continue;
     if (s_mins[rec.stage] > 0) s_mins[rec.stage]--;
@@ -960,6 +986,17 @@ static void prv_draw_diag(Layer *layer, GContext *ctx) {
   graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
   snprintf(line, sizeof(line), "AD %lu", (unsigned long)s_anchor_d);
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  // The T1-admitted partition as prv_base_redecide sees it. It is NOT guaranteed
+  // to equal Gate: prv_measure re-reads rec.stage AFTER the re-decision rewrote
+  // it, so the two Awake skips filter different sets. Close, not identical --
+  // record the difference, do not assume zero.
+  snprintf(line, sizeof(line), "xT2 %u xT3 %u xB %u",
+    (unsigned)s_veto_t2, (unsigned)s_veto_t3, (unsigned)s_veto_both);
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  snprintf(line, sizeof(line), "pass %u", (unsigned)s_veto_none);
   graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 }
