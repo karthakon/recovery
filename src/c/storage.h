@@ -15,12 +15,17 @@ typedef struct __attribute__((packed)) {
 } EpochRecord;
 
 #define NIGHT_SUMMARY_VERSION 3
-// nights-render-spec-v1 s2: bumped BY HAND in the same commit as any spec that
-// changes the classifier. 9 = classifier-spec-v3 (2ae829a, corrected acf88e4):
-// Awake decoupled from the OS mask, immobility onset, prv_awake_redecide
-// before prv_compute_anchor. 8 was classifier-spec-v2 (ed12fd7), the
-// three-term conjunction. 7 was classifier-spec-v1; N1-N16 were 6 and below.
-#define CLASSIFIER_SERIES 9
+// nights-render-spec-v1 s2: bumped BY HAND whenever the classifier's OUTPUT
+// changes -- not only for a spec change. 10 = the T3 known-bit fix (2a2f625):
+// T3 read s_epoch_still alone, so a minute with no accel samples passed the
+// atonia veto; it now requires still && known per classifier-spec-v3 s3.1.
+// A defect fix, NOT a spec change, but it moves the REM decision and the
+// aggregation contract keys on comparability, not on intent. 9 was
+// classifier-spec-v3 (2ae829a, corrected acf88e4): Awake decoupled from the OS
+// mask, immobility onset, prv_awake_redecide before prv_compute_anchor. 8 was
+// classifier-spec-v2 (ed12fd7), the three-term conjunction. 7 was
+// classifier-spec-v1; earlier nights were 6 and below.
+#define CLASSIFIER_SERIES 10
 typedef struct __attribute__((packed)) {
   uint8_t version;  // NIGHT_SUMMARY_VERSION at save time; 0 = pre-versioning
   time_t date;
