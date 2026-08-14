@@ -50,6 +50,14 @@ static bool s_onset_marked;
 static int32_t s_onset_epoch_idx = -1;
 static time_t s_session_start = 0;
 static uint32_t s_night_baseline_var = 0;
+// classifier-spec-v3 s6.1 limb 1 and s6.3: A_H and A_D are stack locals in
+// prv_stop_recording with no persist site and no render site, so neither was
+// checkable before this commit. RAM-only mirrors for the DIAG readout. s_anchor_hr 0 means
+// UNDEFINED (prv_compute_anchor zeroes it when no minute qualifies), so DIAG
+// prints -- for 0 on that line. Not persisted, not in NightSummary.
+static uint16_t s_anchor_hr = 0;
+static uint16_t s_anchor_hr_n = 0;
+static uint32_t s_anchor_d = 0;
 #define BASE_SAMPLE_MAX 160   // safety bound, not a modelling parameter (base-spec-v1 s3.1)
 #define EPOCH_VAR_MAX 960     // 16 h of per-minute variance, RAM only (base-spec-v1 s4)
 #define BASE_SAMPLE_MIN 3
@@ -477,10 +485,11 @@ static void prv_awake_redecide(void) {
 
 // classifier-spec-v1 s3.3: A, the median of F over all non-Awake minutes with
 // F defined. Fills s_epoch_f as it goes. Returns 0 if no minute qualifies.
-static uint32_t prv_compute_anchor(uint16_t *out_anchor_hr) {
+static uint32_t prv_compute_anchor(uint16_t *out_anchor_hr, uint16_t *out_hk) {
   uint16_t n = storage_epoch_count();
   if (n > s_epoch_var_count) n = s_epoch_var_count;
   if (out_anchor_hr) *out_anchor_hr = 0;
+  if (out_hk) *out_hk = 0;
   if (n == 0) return 0;
   for (uint16_t i = 0; i < n; i++) s_epoch_f[i] = prv_window_median(i, n);
   // classifier-spec-v2 s3.3: fill HF alongside F, same pass, same window.
@@ -507,6 +516,7 @@ static uint32_t prv_compute_anchor(uint16_t *out_anchor_hr) {
         s_anchor_scratch[j] = key;
       }
       *out_anchor_hr = (uint16_t)s_anchor_scratch[hk / 2];
+      if (out_hk) *out_hk = hk;
     }
   }
   // Collect the qualifying F values into the scratch array, then sort it.
@@ -573,7 +583,12 @@ static void prv_stop_recording(void) {
   // anchors are medians over a corrected label set. This is the whole point.
   prv_awake_redecide();
   uint16_t anchor_hr = 0;                      // classifier-spec-v2 s3.4
-  uint32_t anchor = prv_compute_anchor(&anchor_hr);
+  uint16_t anchor_hk = 0;                      // count feeding the A_H median
+  uint32_t anchor = prv_compute_anchor(&anchor_hr, &anchor_hk);
+  // classifier-spec-v3 s6.1/s6.3 readout. Mirrors only -- no decision reads these.
+  s_anchor_hr = anchor_hr;
+  s_anchor_hr_n = anchor_hk;
+  s_anchor_d = anchor;
   prv_base_redecide(anchor, anchor_hr);        // s3.4, before the smoother
   prv_measure(anchor);                         // measurement-spec correction s2
   smoother_run(s_mins);
@@ -929,6 +944,22 @@ static void prv_draw_diag(Layer *layer, GContext *ctx) {
     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
   snprintf(line, sizeof(line), "BASE %lu  x2 %lu",
     (unsigned long)s_night_baseline_var, (unsigned long)(s_night_baseline_var * 2));
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  // classifier-spec-v3 s6.1 limb 1 (A_H) and s6.3 (A_D). AH 0 is UNDEFINED,
+  // not measured -- prv_compute_anchor zeroes it when no minute qualifies --
+  // so it prints -- per this screen s convention. n is the count of minutes
+  // feeding the A_H median (non-Awake, HF defined), which review finding 4
+  // needs and which A_H alone cannot show.
+  if (s_anchor_hr == 0) {
+    snprintf(line, sizeof(line), "AH --  n %u", (unsigned)s_anchor_hr_n);
+  } else {
+    snprintf(line, sizeof(line), "AH %u  n %u",
+      (unsigned)s_anchor_hr, (unsigned)s_anchor_hr_n);
+  }
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  snprintf(line, sizeof(line), "AD %lu", (unsigned long)s_anchor_d);
   graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 }
