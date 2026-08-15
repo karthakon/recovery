@@ -15,6 +15,9 @@ static uint32_t s_mv_samples = 0;
 static uint32_t s_mv_moved = 0;
 static uint16_t s_mv_min_samples = 0;
 static uint16_t s_mv_min_moved = 0;
+// Count of minutes closed with NO accel sample (mv_known false). RAM-only,
+// session-scoped, rendered on DIAG. Diagnostic-queue item 17.
+static uint16_t s_unknown_min = 0;
 #define MV_MOVED_PCT 10
 static void prv_accel_peek(void) {
   AccelData d;
@@ -154,6 +157,7 @@ static void prv_close_minute(void) {
     ((uint32_t)s_mv_min_moved * 100 >=
      (uint32_t)s_mv_min_samples * MV_MOVED_PCT);
   MovementState mv = !mv_known ? MV_UNKNOWN : (movement ? MV_MOVED : MV_STILL);
+  if (!mv_known) s_unknown_min++;
   SleepStage st = sleep_stage_classify(&s_minute_buf, s_night_baseline_var,
                                        mv);
   s_mv_min_samples = 0;
@@ -269,6 +273,7 @@ static void prv_start_recording(void) {
   memset(s_epoch_still, 0, sizeof(s_epoch_still));   // classifier-spec-v2 s3.5
   memset(s_epoch_mv_known, 0, sizeof(s_epoch_mv_known)); // c-spec-v3 s3.1
   s_veto_t2 = s_veto_t3 = s_veto_both = s_veto_none = 0;
+  s_unknown_min = 0;
   s_base_sample_count = 0;
   s_base_next_mark = 0;
   s_stop_night_var = 0;
@@ -997,6 +1002,12 @@ static void prv_draw_diag(Layer *layer, GContext *ctx) {
   graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
   snprintf(line, sizeof(line), "pass %u", (unsigned)s_veto_none);
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  // Minutes closed with NO accel sample. prv_accel_peek runs ONLY from
+  // prv_health_handler, so a minute's movement state is KNOWN if and only if
+  // at least one health event arrived in it. Read as ZERO or NON-ZERO only.
+  snprintf(line, sizeof(line), "Unk %u", (unsigned)s_unknown_min);
   graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 }
