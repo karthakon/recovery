@@ -25,7 +25,10 @@ typedef struct __attribute__((packed)) {
 // mask, immobility onset, prv_awake_redecide before prv_compute_anchor. 8 was
 // classifier-spec-v2 (ed12fd7), the three-term conjunction. 7 was
 // classifier-spec-v1; earlier nights were 6 and below.
-#define CLASSIFIER_SERIES 10
+// 11 is movement-spec-v1: the accelerometer is SUBSCRIBED at 10Hz / 25
+// samples and prv_accel_peek is deleted. A filters on accelerometer evidence,
+// so the anchor scalars are spent by this change, not only the veto counters.
+#define CLASSIFIER_SERIES 11
 typedef struct __attribute__((packed)) {
   uint8_t version;  // NIGHT_SUMMARY_VERSION at save time; 0 = pre-versioning
   time_t date;

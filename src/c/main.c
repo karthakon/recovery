@@ -9,7 +9,8 @@ static Layer *s_canvas;
 static bool s_recording = false;
 static uint32_t s_hr_events = 0;
 static uint32_t s_hrv_events = 0;
-// Movement corroboration: accel_service_peek only, never subscribed.
+// movement-spec-v1 s3: accelerometer data SUBSCRIPTION, 10Hz / 25 samples.
+// accel_service_peek CANNOT be used while subscribed (pebble.h 769,789).
 // mag2 in milli-g squared; 1g rest == 1000000. Display-only for now.
 static uint32_t s_mv_samples = 0;
 static uint32_t s_mv_moved = 0;
@@ -19,15 +20,26 @@ static uint16_t s_mv_min_moved = 0;
 // session-scoped, rendered on DIAG. Diagnostic-queue item 17.
 static uint16_t s_unknown_min = 0;
 #define MV_MOVED_PCT 10
-static void prv_accel_peek(void) {
-  AccelData d;
-  if (accel_service_peek(&d) != 0) return;
-  int32_t mag2 = (int32_t)d.x * d.x + (int32_t)d.y * d.y + (int32_t)d.z * d.z;
-  s_mv_samples++;
-  s_mv_min_samples++;
-  if (mag2 < 722500 || mag2 > 1322500) {
-    s_mv_moved++;
-    s_mv_min_moved++;
+// movement-spec-v1 s5: vibrated samples are COUNTED, NOT FILTERED. They still
+// feed the movement counters exactly as the peek path did. Changes NO
+// decision. did_vibrate was ALWAYS available - the peek path never read it.
+static uint32_t s_vibe_samples = 0;
+// movement-spec-v1 s6: minutes with Quiet Time active. The API is READ-ONLY
+// (pebble.h 9003) - an app CANNOT enable it or prevent its being disabled.
+static uint16_t s_qt_min = 0;
+// movement-spec-v1 s3: the magnitude test is UNCHANGED. Only the arrival path
+// changes - one handler call now carries many samples instead of one peek.
+static void prv_accel_data_handler(AccelData *data, uint32_t num_samples) {
+  for (uint32_t i = 0; i < num_samples; i++) {
+    AccelData d = data[i];
+    if (d.did_vibrate) s_vibe_samples++;
+    int32_t mag2 = (int32_t)d.x * d.x + (int32_t)d.y * d.y + (int32_t)d.z * d.z;
+    s_mv_samples++;
+    s_mv_min_samples++;
+    if (mag2 < 722500 || mag2 > 1322500) {
+      s_mv_moved++;
+      s_mv_min_moved++;
+    }
   }
 }
 static uint16_t s_last_ppi = 0;
@@ -158,6 +170,8 @@ static void prv_close_minute(void) {
      (uint32_t)s_mv_min_samples * MV_MOVED_PCT);
   MovementState mv = !mv_known ? MV_UNKNOWN : (movement ? MV_MOVED : MV_STILL);
   if (!mv_known) s_unknown_min++;
+  // movement-spec-v1 s6: RECORDED, NOT ACTED ON. Changes no decision.
+  if (quiet_time_is_active()) s_qt_min++;
   SleepStage st = sleep_stage_classify(&s_minute_buf, s_night_baseline_var,
                                        mv);
   s_mv_min_samples = 0;
@@ -231,7 +245,6 @@ static void prv_tick_handler(struct tm *tick_time, TimeUnits changed) {
 }
 
 static void prv_health_handler(HealthEventType event, void *context) {
-  prv_accel_peek();
   if (event == HealthEventHeartRateUpdate) {
     s_hr_events++;
     HealthValue hr = health_service_peek_current_value(HealthMetricHeartRateRawBPM);
@@ -274,6 +287,8 @@ static void prv_start_recording(void) {
   memset(s_epoch_mv_known, 0, sizeof(s_epoch_mv_known)); // c-spec-v3 s3.1
   s_veto_t2 = s_veto_t3 = s_veto_both = s_veto_none = 0;
   s_unknown_min = 0;
+  s_vibe_samples = 0;                                // movement-spec-v1 s5
+  s_qt_min = 0;                                      // movement-spec-v1 s6
   s_base_sample_count = 0;
   s_base_next_mark = 0;
   s_stop_night_var = 0;
@@ -577,10 +592,10 @@ static void prv_base_redecide(uint32_t anchor, uint16_t anchor_hr) {
     // atonia veto, read from the RAM-only bitmap (s3.5 as corrected).
     bool t2 = (anchor_hr > 0) && (s_epoch_hf[i] > anchor_hr);
     // classifier-spec-v3 s3.1: UNKNOWN is NEVER treated as STILL. s_epoch_still
-    // is set whenever !movement, which includes minutes with NO accel samples
-    // (prv_accel_peek runs only inside prv_health_handler), so the known-bit is
-    // required at read time -- the contract main.c 188-189 states and which the
-    // Awake path already honours at 429-430 and 461-462. T3 read stillness alone
+    // is set whenever !movement. Under movement-spec-v1 the accelerometer
+    // is SUBSCRIBED and owns its cadence, but a minute with NO samples is
+    // still possible, so the known-bit is STILL required at read time -- the
+    // same contract the Awake path already honours. T3 read stillness alone
     // here, so a sensor gap passed the atonia veto. classifier-spec-v2 s4.3's
     // intact-atonia assumption is unchanged; this makes the veto mean what it says.
     bool t3 = ((s_epoch_still[i >> 3] & (uint8_t)(1 << (i & 7))) != 0)
@@ -1004,9 +1019,16 @@ static void prv_draw_diag(Layer *layer, GContext *ctx) {
   snprintf(line, sizeof(line), "pass %u", (unsigned)s_veto_none);
   graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
-  // Minutes closed with NO accel sample. prv_accel_peek runs ONLY from
-  // prv_health_handler, so a minute's movement state is KNOWN if and only if
-  // at least one health event arrived in it. Read as ZERO or NON-ZERO only.
+  // movement-spec-v1 s5, s6: vibrated samples, and minutes with Quiet Time
+  // active. BOTH RECORDED, NOT SCORED. Neither changes a decision.
+  snprintf(line, sizeof(line), "Vib %lu  QT %u",
+    (unsigned long)s_vibe_samples, (unsigned)s_qt_min);
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  // Minutes closed with NO accel sample. Under movement-spec-v1 the accel is
+  // SUBSCRIBED with its own cadence, so this is no longer bounded by the
+  // health-event stream. RETAINED PERMANENTLY per s7 - it is the instrument
+  // that verifies the swap. Read as ZERO or NON-ZERO only.
   snprintf(line, sizeof(line), "Unk %u", (unsigned)s_unknown_min);
   graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
@@ -1333,6 +1355,11 @@ static void prv_init(void) {
   s_base_sample_count = 0;
   s_base_next_mark = 0;
   health_service_events_subscribe(prv_health_handler, NULL);
+  // movement-spec-v1 s3: TWO calls - subscribe carries no rate parameter.
+  // APP-LIFETIME, not recording-scoped, because prv_close_minute runs
+  // unconditionally and the peek path it replaces also ran outside recording.
+  accel_service_set_sampling_rate(ACCEL_SAMPLING_10HZ);
+  accel_data_service_subscribe(25, prv_accel_data_handler);
   prv_set_hrv(true);
   tick_timer_service_subscribe(MINUTE_UNIT, prv_tick_handler);
 }
@@ -1341,6 +1368,7 @@ static void prv_deinit(void) {
   if (s_recording) prv_stop_recording();
   prv_set_hrv(false);
   tick_timer_service_unsubscribe();
+  accel_data_service_unsubscribe();                  // movement-spec-v1 s3
   health_service_events_unsubscribe();
   window_destroy(s_window);
 }
