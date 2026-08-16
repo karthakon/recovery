@@ -115,7 +115,7 @@ static uint16_t s_mins[4] = {0, 0, 0, 0};
 static uint8_t s_awake_streak = 0;
 static SleepStage s_last_stage = StageLight;
 static AppTimer *s_ui_timer = NULL;
-typedef enum { MODE_IDLE, MODE_RECORDING, MODE_RESULTS, MODE_HYPNO, MODE_HISTORY, MODE_DIAG, MODE_RUNS } ScreenMode;
+typedef enum { MODE_IDLE, MODE_RECORDING, MODE_RESULTS, MODE_HYPNO, MODE_HISTORY, MODE_DIAG, MODE_DIAG2, MODE_RUNS } ScreenMode;
 static ScreenMode s_mode = MODE_IDLE;
 static uint8_t s_hist_idx = 0;      // 0 = newest
 static uint8_t s_hist_count = 0;    // populated nights at entry
@@ -1047,9 +1047,24 @@ static void prv_draw_diag(Layer *layer, GContext *ctx) {
   snprintf(line, sizeof(line), "pass %u", (unsigned)s_veto_none);
   graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+}
+// DIAG 2. The DIAG screen overflowed at GOTHIC_14 once the percentile lines
+// were added, pushing Unk off the bottom -- and Unk is the instrument that
+// verifies the movement-spec-v1 swap. Split rather than shrink the font or
+// drop a field. UP returns to DIAG 1.
+static void prv_draw_diag2(Layer *layer, GContext *ctx) {
+  GRect b = layer_get_bounds(layer);
+  graphics_context_set_text_color(ctx, GColorBlack);
+  char line[64];
+  int y = 2;
+  GFont f = fonts_get_system_font(FONT_KEY_GOTHIC_14);
+  snprintf(line, sizeof(line), "Diag 2");
+  graphics_draw_text(ctx, line, fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
+    GRect(4, y, b.size.w - 8, 26), GTextOverflowModeTrailingEllipsis,
+    GTextAlignmentLeft, NULL); y += 26;
   // classifier-spec-v4 s5: F(m) percentiles over the T1 population, and its
   // size. RECORDED, NOT SCORED. p50 is A_D itself and is printed as a
-  // cross-check against the AD line above -- they MUST agree.
+  // cross-check against the AD line on DIAG 1 -- they MUST agree.
   snprintf(line, sizeof(line), "Fd %lu %lu",
     (unsigned long)s_fd_p50, (unsigned long)s_fd_p75);
   graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
@@ -1224,6 +1239,7 @@ static void prv_canvas_update(Layer *layer, GContext *ctx) {
     case MODE_RESULTS:   prv_draw_results(layer, ctx);   break;
     case MODE_HYPNO:     prv_draw_hypno(layer, ctx);     break;
     case MODE_DIAG:      prv_draw_diag(layer, ctx);      break;
+    case MODE_DIAG2:     prv_draw_diag2(layer, ctx);     break;
     case MODE_RUNS:      prv_draw_runs(layer, ctx);      break;
     case MODE_HISTORY:   prv_draw_history(layer, ctx);   break;
     case MODE_IDLE:
@@ -1317,6 +1333,16 @@ static void prv_diag_to_hypno(ClickRecognizerRef r, void *ctx) {
   window_set_click_config_provider(s_window, prv_click_config);
   layer_mark_dirty(s_canvas);
 }
+static void prv_diag_to_diag2(ClickRecognizerRef r, void *ctx) {
+  s_mode = MODE_DIAG2;
+  window_set_click_config_provider(s_window, prv_click_config);
+  layer_mark_dirty(s_canvas);
+}
+static void prv_diag2_to_diag(ClickRecognizerRef r, void *ctx) {
+  s_mode = MODE_DIAG;
+  window_set_click_config_provider(s_window, prv_click_config);
+  layer_mark_dirty(s_canvas);
+}
 static void prv_idle_to_runs(ClickRecognizerRef r, void *ctx) {
   s_mode = MODE_RUNS;
   window_set_click_config_provider(s_window, prv_click_config);
@@ -1352,7 +1378,12 @@ static void prv_click_config(void *ctx) {
       break;
     case MODE_DIAG:
       window_single_click_subscribe(BUTTON_ID_UP, prv_diag_to_hypno);
+      window_single_click_subscribe(BUTTON_ID_DOWN, prv_diag_to_diag2);
       window_single_click_subscribe(BUTTON_ID_BACK, prv_diag_to_hypno);
+      break;
+    case MODE_DIAG2:
+      window_single_click_subscribe(BUTTON_ID_UP, prv_diag2_to_diag);
+      window_single_click_subscribe(BUTTON_ID_BACK, prv_diag2_to_diag);
       break;
     case MODE_RUNS:
       window_single_click_subscribe(BUTTON_ID_UP, prv_runs_to_idle);
