@@ -37,12 +37,16 @@ static const int16_t TRANS[NS][NS] = {
 #define EMIT_HIT  -106
 #define EMIT_MISS -768
 
-// REM-latency prior (spec section 3), multiplier on REM emission only:
-// 0-45 min: 0.25 ; 45-90 min: 0.50 ; 90+ : 1.00.
-// log2(0.25)*256 = -512 ; log2(0.50)*256 = -256 ; log2(1.0)*256 = 0.
+// REM-latency prior, multiplier on REM emission only. smoothing-spec-v2 s2
+// EXTENDS the table past neutral; the first three rows are UNCHANGED.
+// 0-45: 0.25 ; 45-90: 0.50 ; 90-180: 1.00 ; 180-300: 2.00 ; 300+: 4.00.
+// log2(m)*256: -512 ; -256 ; 0 ; +256 ; +512. The same doubling ladder,
+// continued in the direction it already ran. NOT new fitted constants.
 #define REM_LAT_EARLY -512
 #define REM_LAT_MID   -256
 #define REM_LAT_LATE     0
+#define REM_LAT_L3     256
+#define REM_LAT_L4     512
 
 // Minimum episode durations, minutes (spec section 4).
 #define MIN_EP_REM   5
@@ -73,10 +77,14 @@ static uint8_t s_bp[MAX_EPOCHS][NS];// Viterbi backpointers
 
 // REM-latency multiplier for an epoch given minutes since onset.
 static int16_t rem_lat_mult(int mins_since_onset) {
-  if (mins_since_onset < 0)  return REM_LAT_EARLY; // before onset: suppress
-  if (mins_since_onset < 45) return REM_LAT_EARLY;
-  if (mins_since_onset < 90) return REM_LAT_MID;
-  return REM_LAT_LATE;
+  if (mins_since_onset < 0)   return REM_LAT_EARLY; // before onset: suppress
+  if (mins_since_onset < 45)  return REM_LAT_EARLY;
+  if (mins_since_onset < 90)  return REM_LAT_MID;
+  // smoothing-spec-v2 s2: boundaries are standard sleep architecture at
+  // roughly 90-minute cycles -- 180 is about cycle 3, 300 about cycle 5.
+  if (mins_since_onset < 180) return REM_LAT_LATE;
+  if (mins_since_onset < 300) return REM_LAT_L3;
+  return REM_LAT_L4;
 }
 
 // Emission log-prob of observing s_obs[t] given hidden state `hid`,

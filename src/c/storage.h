@@ -28,7 +28,12 @@ typedef struct __attribute__((packed)) {
 // 11 is movement-spec-v1: the accelerometer is SUBSCRIBED at 10Hz / 25
 // samples and prv_accel_peek is deleted. A filters on accelerometer evidence,
 // so the anchor scalars are spent by this change, not only the veto counters.
-#define CLASSIFIER_SERIES 11
+// 12 is classifier-spec-v4 (T1 admits above A_D, not 2*A_D; Gate follows the
+// same threshold) TOGETHER WITH smoothing-spec-v2 (the REM latency table gains
+// two promoting rows past 180 and 300 minutes). Bundled deliberately: the
+// admission change is the binding one and the latency change cannot act
+// without it. Both are frozen specs, not tuning.
+#define CLASSIFIER_SERIES 12
 typedef struct __attribute__((packed)) {
   uint8_t version;  // NIGHT_SUMMARY_VERSION at save time; 0 = pre-versioning
   time_t date;

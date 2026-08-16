@@ -19,6 +19,12 @@ static uint16_t s_mv_min_moved = 0;
 // Count of minutes closed with NO accel sample (mv_known false). RAM-only,
 // session-scoped, rendered on DIAG. Diagnostic-queue item 17.
 static uint16_t s_unknown_min = 0;
+// classifier-spec-v4 s5: percentile summary of F(m) over the T1 population --
+// the SAME population A_D is the median of. RAM-only, session-scoped,
+// RECORDED AND NOT SCORED. Changes no decision. Exists so any future move of
+// the admission threshold is a choice against a MEASURED distribution.
+static uint32_t s_fd_p50 = 0, s_fd_p75 = 0, s_fd_p90 = 0, s_fd_p95 = 0;
+static uint16_t s_fd_n = 0;
 #define MV_MOVED_PCT 10
 // movement-spec-v1 s5: vibrated samples are COUNTED, NOT FILTERED. They still
 // feed the movement counters exactly as the peek path did. Changes NO
@@ -287,6 +293,8 @@ static void prv_start_recording(void) {
   memset(s_epoch_mv_known, 0, sizeof(s_epoch_mv_known)); // c-spec-v3 s3.1
   s_veto_t2 = s_veto_t3 = s_veto_both = s_veto_none = 0;
   s_unknown_min = 0;
+  s_fd_p50 = s_fd_p75 = s_fd_p90 = s_fd_p95 = 0;     // classifier-spec-v4 s5
+  s_fd_n = 0;                                        // classifier-spec-v4 s5
   s_vibe_samples = 0;                                // movement-spec-v1 s5
   s_qt_min = 0;                                      // movement-spec-v1 s6
   s_base_sample_count = 0;
@@ -345,7 +353,10 @@ static void prv_measure(uint32_t base_final) {
   // and applies the same skips prv_base_redecide applies. This MUST run before
   // the compaction below, which destroys epoch indexing.
   if (base_final > 0) {
-    uint32_t gate = base_final * 2;
+    // classifier-spec-v4 s2: Gate MUST test the same threshold the classifier
+    // decides on, or the partition counters describe a different population
+    // than the decision did.
+    uint32_t gate = base_final;
     uint16_t en = storage_epoch_count();
     if (en > s_epoch_var_count) en = s_epoch_var_count;
     for (uint16_t i = 0; i < en; i++) {
@@ -569,6 +580,19 @@ static uint32_t prv_compute_anchor(uint16_t *out_anchor_hr, uint16_t *out_hk) {
     }
     s_anchor_scratch[j] = key;
   }
+  // classifier-spec-v4 s5: read the percentiles off the ALREADY-SORTED
+  // scratch. Same array, same population, no extra pass and no extra sort.
+  s_fd_n = k;
+  uint32_t i75 = (uint32_t)k * 3 / 4;
+  uint32_t i90 = (uint32_t)k * 9 / 10;
+  uint32_t i95 = (uint32_t)k * 19 / 20;
+  if (i75 >= (uint32_t)k) i75 = (uint32_t)k - 1;
+  if (i90 >= (uint32_t)k) i90 = (uint32_t)k - 1;
+  if (i95 >= (uint32_t)k) i95 = (uint32_t)k - 1;
+  s_fd_p50 = s_anchor_scratch[k / 2];
+  s_fd_p75 = s_anchor_scratch[i75];
+  s_fd_p90 = s_anchor_scratch[i90];
+  s_fd_p95 = s_anchor_scratch[i95];
   return s_anchor_scratch[k / 2];             // upper-middle, no averaging
 }
 
@@ -600,15 +624,19 @@ static void prv_base_redecide(uint32_t anchor, uint16_t anchor_hr) {
     // intact-atonia assumption is unchanged; this makes the veto mean what it says.
     bool t3 = ((s_epoch_still[i >> 3] & (uint8_t)(1 << (i & 7))) != 0)
            && ((s_epoch_mv_known[i >> 3] & (uint8_t)(1 << (i & 7))) != 0);
-    if (v * 2 >= anchor && v <= anchor * 2) {
+    // classifier-spec-v4 s2: the Light band's UPPER edge moves from 2*A_D to
+    // A_D. The LOWER edge is UNCHANGED. Chain shape and order are unchanged.
+    // T1 now admits the upper half of the night's own F distribution as REM
+    // CANDIDATES; T2 and T3 still subtract from that pool.
+    if (v * 2 >= anchor && v <= anchor) {
       ns_stage = StageLight;
-    } else if (v > anchor * 2 && t2 && t3) {
+    } else if (v > anchor && t2 && t3) {
       ns_stage = StageREM;
     } else {
       ns_stage = StageLight;
     }
     // Tally AFTER the decision, over T1-admitted minutes only. Counting, not deciding.
-    if (v > anchor * 2) {
+    if (v > anchor) {                                // classifier-spec-v4 s2
       if (t2 && t3)       s_veto_none++;
       else if (!t2 && !t3) s_veto_both++;
       else if (!t2)        s_veto_t2++;
@@ -1017,6 +1045,17 @@ static void prv_draw_diag(Layer *layer, GContext *ctx) {
   graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
   snprintf(line, sizeof(line), "pass %u", (unsigned)s_veto_none);
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  // classifier-spec-v4 s5: F(m) percentiles over the T1 population, and its
+  // size. RECORDED, NOT SCORED. p50 is A_D itself and is printed as a
+  // cross-check against the AD line above -- they MUST agree.
+  snprintf(line, sizeof(line), "Fd %lu %lu",
+    (unsigned long)s_fd_p50, (unsigned long)s_fd_p75);
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  snprintf(line, sizeof(line), "Fd %lu %lu n %u",
+    (unsigned long)s_fd_p90, (unsigned long)s_fd_p95, (unsigned)s_fd_n);
   graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
   // movement-spec-v1 s5, s6: vibrated samples, and minutes with Quiet Time
