@@ -862,6 +862,14 @@ static void prv_draw_hypno(Layer *layer, GContext *ctx) {
     graphics_context_set_fill_color(ctx, prv_stage_color(rec.stage));
     graphics_fill_rect(ctx, GRect(x0, bottom - h, w, h), 0, GCornerNone);
   }
+  // hypno_hour_tick: one epoch is one minute, so hour boundaries are at
+  // i = 60, 120, ... Drawn AFTER the bars so a tick is never overpainted.
+  // Cosmetic only - reads no stage and changes no decision.
+  graphics_context_set_stroke_color(ctx, GColorBlack);
+  for (uint16_t i = 60; i < n; i += 60) {
+    int xh = 4 + (int)((uint32_t)i * plot_w / n);
+    graphics_draw_line(ctx, GPoint(xh, top), GPoint(xh, bottom));
+  }
 }
 
 static void prv_draw_history(Layer *layer, GContext *ctx) {
@@ -1106,6 +1114,12 @@ typedef struct {
   // immobility onset s_onset_epoch_idx -- both are rendered so the
   // divergence is observable. -1 when no onset was found.
   int16_t onset_label;
+  // Transition counters. Awake->REM is physiologically implausible;
+  // TRANS permits it at 0.017 rather than forbidding it. Counted on
+  // BOTH series: _pre over EpochRecord.reserved (pre-smoother), _post
+  // over rec.stage (final). DIAGNOSTIC ONLY - changes no decision.
+  uint16_t tr_ar_pre, tr_ar_post;
+  uint16_t tr_ra_pre, tr_ra_post;
 } RunStats;
 
 // Onset by the SAME ONSET_RUN 5 consecutive non-Awake rule find_onset uses
@@ -1125,11 +1139,23 @@ static void prv_compute_runs(RunStats *st) {
   int first_rem = -1;
   uint16_t onset_run = 0;
   uint16_t cur_run = 0;
+  uint8_t prev_pre = 0, prev_post = 0;
+  bool have_prev = false;
 
   for (uint16_t t = 0; t < n; t++) {
     EpochRecord rec;
     if (!storage_epoch_read(t, &rec)) { continue; }
     uint8_t st_pre = rec.reserved;
+    uint8_t st_post = rec.stage;
+    if (have_prev) {
+      if (prev_pre == StageAwake && st_pre == StageREM) st->tr_ar_pre++;
+      if (prev_pre == StageREM && st_pre == StageAwake) st->tr_ra_pre++;
+      if (prev_post == StageAwake && st_post == StageREM) st->tr_ar_post++;
+      if (prev_post == StageREM && st_post == StageAwake) st->tr_ra_post++;
+    }
+    prev_pre = st_pre;
+    prev_post = st_post;
+    have_prev = true;
 
     if (onset_idx < 0) {
       if (st_pre != StageAwake) {
@@ -1218,6 +1244,11 @@ static void prv_draw_runs(Layer *layer, GContext *ctx) {
   graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
 
+  snprintf(line, sizeof(line), "A>R %u/%u  R>A %u/%u",
+    (unsigned)st.tr_ar_pre, (unsigned)st.tr_ar_post,
+    (unsigned)st.tr_ra_pre, (unsigned)st.tr_ra_post);
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
   // classifier-spec-v3 s3.4. Ons  = live immobility onset epoch index.
   // OnsL = label-derived onset, the one Off is measured against. They were
   // the same quantity before v3. An undefined value prints -- and NEVER 0.
