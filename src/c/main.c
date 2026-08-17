@@ -33,6 +33,14 @@ static uint32_t s_vibe_samples = 0;
 // movement-spec-v1 s6: minutes with Quiet Time active. The API is READ-ONLY
 // (pebble.h 9003) - an app CANNOT enable it or prevent its being disabled.
 static uint16_t s_qt_min = 0;
+// awake-clause-counters-spec-v1 s2: which of prv_awake_redecide's two
+// independent clauses fired, partitioned three ways over two spans from
+// onset. INSTRUMENT ONLY - incremented from the SAME c1 and c2 booleans
+// the decision uses, never recomputed, so they cannot disagree with it.
+// s4: no decision changes, CLASSIFIER_SERIES is NOT bumped.
+#define AWC_EARLY_MIN 60
+static uint16_t s_awc_c1_early = 0, s_awc_c2_early = 0, s_awc_both_early = 0;
+static uint16_t s_awc_c1_late = 0, s_awc_c2_late = 0, s_awc_both_late = 0;
 // movement-spec-v1 s3: the magnitude test is UNCHANGED. Only the arrival path
 // changes - one handler call now carries many samples instead of one peek.
 static void prv_accel_data_handler(AccelData *data, uint32_t num_samples) {
@@ -297,6 +305,8 @@ static void prv_start_recording(void) {
   s_fd_n = 0;                                        // classifier-spec-v4 s5
   s_vibe_samples = 0;                                // movement-spec-v1 s5
   s_qt_min = 0;                                      // movement-spec-v1 s6
+  s_awc_c1_early = s_awc_c2_early = s_awc_both_early = 0;   // awc-spec-v1 s2
+  s_awc_c1_late = s_awc_c2_late = s_awc_both_late = 0;      // awc-spec-v1 s2
   s_base_sample_count = 0;
   s_base_next_mark = 0;
   s_stop_night_var = 0;
@@ -514,6 +524,17 @@ static void prv_awake_redecide(void) {
               ((uint32_t)s_epoch_hf[i] * 100 > a_hr * 103);
 
     SleepStage ns_stage = (c1 || c2) ? StageAwake : StageLight;
+    // awake-clause-counters-spec-v1 s2: counted from the SAME booleans the
+    // decision uses, and BEFORE any continue below, so no Awake minute at or
+    // after onset can be skipped. s2: pre-onset minutes are counted in
+    // NEITHER span; when onset is undefined all six stay zero.
+    if ((c1 || c2) && s_onset_epoch_idx >= 0 &&
+        i >= (uint16_t)s_onset_epoch_idx) {
+      bool early = (i < (uint16_t)s_onset_epoch_idx + AWC_EARLY_MIN);
+      if (c1 && c2)      { if (early) s_awc_both_early++; else s_awc_both_late++; }
+      else if (c1)       { if (early) s_awc_c1_early++;   else s_awc_c1_late++;   }
+      else               { if (early) s_awc_c2_early++;   else s_awc_c2_late++;   }
+    }
     // Clearing goes to Light so the minute becomes eligible for step 5's
     // Light/REM decision, which skips StageAwake (bae23c3 s2, unchanged).
     if (!(c1 || c2) && rec.stage != (uint8_t)StageAwake) continue;
@@ -1092,6 +1113,21 @@ static void prv_draw_diag2(Layer *layer, GContext *ctx) {
   // health-event stream. RETAINED PERMANENTLY per s7 - it is the instrument
   // that verifies the swap. Read as ZERO or NON-ZERO only.
   snprintf(line, sizeof(line), "Unk %u", (unsigned)s_unknown_min);
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+  y += 18;
+  // awake-clause-counters-spec-v1 s5: which Awake clause fired, at or after
+  // onset only. e = first AWC_EARLY_MIN minutes from onset, l = the rest.
+  // B = both clauses in the same minute. RECORDED, NOT SCORED - no band.
+  // s6: the six MUST sum to the Awake minutes at or after onset.
+  snprintf(line, sizeof(line), "C1e %u C2e %u Be %u",
+    (unsigned)s_awc_c1_early, (unsigned)s_awc_c2_early,
+    (unsigned)s_awc_both_early);
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  snprintf(line, sizeof(line), "C1l %u C2l %u Bl %u",
+    (unsigned)s_awc_c1_late, (unsigned)s_awc_c2_late,
+    (unsigned)s_awc_both_late);
   graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 }
