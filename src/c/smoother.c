@@ -54,6 +54,13 @@ static const int16_t TRANS[NS][NS] = {
 #define MIN_EP_AWAKE 2
 #define MIN_EP_PASSES 3
 
+// smoothing-spec-v3: REM entered directly from wake is physiologically
+// implausible; REM RESUMING after a brief arousal inside a REM period is
+// normal. 15 minutes is the conventional separation below which two REM
+// bouts belong to the SAME REM period, so a wake gap shorter than this
+// leaves the sleeper in that period. Definitional, not fitted.
+#define REM_RESUME_LOOKBACK 15
+
 // ---- state-index <-> SleepStage mapping ----
 static uint8_t stage_to_idx(uint8_t st) {
   switch (st) {
@@ -194,6 +201,40 @@ static bool min_episode_pass(uint16_t n) {
   return true;
 }
 
+// rem_resume_repair: forbid Awake -> REM as an ENTRY, permit it as a
+// RESUMPTION. For each Awake->REM boundary, look back REM_RESUME_LOOKBACK
+// minutes from the START of the Awake episode. Any REM there makes it a
+// resumption and it stands. No REM there makes it an entry from wake and
+// the REM episode becomes Light.
+//
+// Runs AFTER the min-episode passes and therefore has the last word. This
+// can leave a Light episode shorter than MIN_EP_LIGHT -- accepted
+// deliberately: min-episode is a smoothing heuristic, the prohibition on
+// entering REM from wake is physiology.
+static void rem_resume_repair(uint16_t n) {
+  if (n < 2) return;
+  for (uint16_t t = 1; t < n; t++) {
+    if (s_path[t] != S_RM || s_path[t - 1] != S_AW) continue;
+    // Walk back to the first epoch of this Awake episode.
+    uint16_t aw_start = t - 1;
+    while (aw_start > 0 && s_path[aw_start - 1] == S_AW) aw_start--;
+    // Look back REM_RESUME_LOOKBACK epochs before the Awake episode.
+    uint16_t lb_end = aw_start;
+    uint16_t lb_start = (aw_start > REM_RESUME_LOOKBACK)
+                          ? (uint16_t)(aw_start - REM_RESUME_LOOKBACK) : 0;
+    bool resumption = false;
+    for (uint16_t k = lb_start; k < lb_end; k++) {
+      if (s_path[k] == S_RM) { resumption = true; break; }
+    }
+    if (resumption) continue;
+    // Entry from wake: demote the whole REM episode to Light.
+    uint16_t re = t;
+    while (re + 1 < n && s_path[re + 1] == S_RM) re++;
+    for (uint16_t k = t; k <= re; k++) s_path[k] = S_LT;
+    t = re;
+  }
+}
+
 void smoother_run(uint16_t out_mins[4]) {
   out_mins[StageAwake] = 0;
   out_mins[StageLight] = 0;
@@ -215,6 +256,7 @@ void smoother_run(uint16_t out_mins[4]) {
   for (uint8_t pass = 0; pass < MIN_EP_PASSES; pass++) {
     if (!min_episode_pass(n)) break;
   }
+  rem_resume_repair(n);
 
   // Write smoothed stages back; preserve raw stage in reserved.
   for (uint16_t t = 0; t < n; t++) {

@@ -33,7 +33,7 @@ typedef struct __attribute__((packed)) {
 // two promoting rows past 180 and 300 minutes). Bundled deliberately: the
 // admission change is the binding one and the latency change cannot act
 // without it. Both are frozen specs, not tuning.
-#define CLASSIFIER_SERIES 12
+#define CLASSIFIER_SERIES 13
 typedef struct __attribute__((packed)) {
   uint8_t version;  // NIGHT_SUMMARY_VERSION at save time; 0 = pre-versioning
   time_t date;
