@@ -1156,6 +1156,12 @@ typedef struct {
   // over rec.stage (final). DIAGNOSTIC ONLY - changes no decision.
   uint16_t tr_ar_pre, tr_ar_post;
   uint16_t tr_ra_pre, tr_ra_post;
+  // awc-spec-v1 identity-correction 2026-08-18 s2: AwO, the count of epochs
+  // whose PRE-smoother stage is Awake at or after s_onset_epoch_idx. The
+  // right-hand side of the corrected identity. UNDEFINED when onset is
+  // undefined -- prints -- and NEVER 0 (measurement-spec-v1 s3.6).
+  uint16_t awake_post_onset;
+  bool has_awo;
 } RunStats;
 
 // Onset by the SAME ONSET_RUN 5 consecutive non-Awake rule find_onset uses
@@ -1192,6 +1198,14 @@ static void prv_compute_runs(RunStats *st) {
     prev_pre = st_pre;
     prev_post = st_post;
     have_prev = true;
+    // awc-spec-v1 identity-correction 2026-08-18 s3: counted over reserved,
+    // the PRE-smoother series, restricted to the same span the six counters
+    // use. main.c 538 leaves the Awake set EXACTLY equal to (c1 || c2) and
+    // prv_base_redecide skips Awake, so this is the same population.
+    if (s_onset_epoch_idx >= 0 && t >= (uint16_t)s_onset_epoch_idx &&
+        st_pre == (uint8_t)StageAwake) {
+      st->awake_post_onset++;
+    }
 
     if (onset_idx < 0) {
       if (st_pre != StageAwake) {
@@ -1230,6 +1244,11 @@ static void prv_compute_runs(RunStats *st) {
   }
 
   if (onset_idx >= 0) st->onset_label = (int16_t)onset_idx;
+  // awc-spec-v1 identity-correction 2026-08-18 s4: AwO is UNDEFINED when the
+  // live immobility onset is undefined -- NOT zero. Keyed on
+  // s_onset_epoch_idx, the index the six counters branch on, NOT on
+  // onset_label, which is a different quantity (c-spec-v3 s3.4).
+  st->has_awo = (s_onset_epoch_idx >= 0);
   if (onset_idx >= 0 && first_rem >= 0) {
     st->first_off = (int16_t)(first_rem - onset_idx);
     st->has_off = true;
@@ -1295,6 +1314,16 @@ static void prv_draw_runs(Layer *layer, GContext *ctx) {
     if (st.onset_label >= 0) snprintf(a2, sizeof(a2), "%d", (int)st.onset_label);
     else snprintf(a2, sizeof(a2), "--");
     snprintf(line, sizeof(line), "Ons %s  OnsL %s", a1, a2);
+  }
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  // awc-spec-v1 identity-correction 2026-08-18 s4: the right-hand side of the
+  // corrected identity. RUNS reads PERSIST, so unlike DIAG 2 this survives app
+  // exit and the conditioning check can be re-read at IDLE.
+  if (st.has_awo) {
+    snprintf(line, sizeof(line), "AwO %u", (unsigned)st.awake_post_onset);
+  } else {
+    snprintf(line, sizeof(line), "AwO --");
   }
   graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
