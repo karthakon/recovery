@@ -156,6 +156,14 @@ static uint16_t s_mv_n = 0;
 static uint16_t s_epoch_ahr[EPOCH_VAR_MAX];
 static uint16_t s_ahr_min = 0;
 static uint16_t s_ahr_max = 0;
+// awake-reference-ab-readout-spec-v1 s2: the WHOLE-NIGHT reference, retained
+// as a COUNTERFACTUAL ONLY. NOTHING READS IT AND IT DECIDES NOTHING -- c2
+// continues to read s_epoch_ahr and only that (s5). It exists to be counted
+// against, so the reference change is attributable WITHIN one night rather
+// than across a comparability boundary it cannot cross. 0 means UNDEFINED.
+static uint16_t s_ahr_whole = 0;
+static uint16_t s_ab_w = 0;   // minutes c2 WOULD fire on the whole-night ref
+static uint16_t s_ab_l = 0;   // minutes c2 DID fire on the time-local ref
 static uint32_t s_stop_night_var = 0;
 static uint8_t s_batt_start = 0;
 static uint8_t s_batt_end = 0;
@@ -361,6 +369,8 @@ static void prv_start_recording(void) {
   s_mv_p50 = s_mv_p90 = s_mv_p99 = s_mv_max = s_mv_n = 0;
   memset(s_epoch_ahr, 0, sizeof(s_epoch_ahr));       // classifier-spec-v5 s2
   s_ahr_min = s_ahr_max = 0;                         // classifier-spec-v5 s7
+  s_ahr_whole = 0;                                   // ab-readout-spec-v1 s2
+  s_ab_w = s_ab_l = 0;                               // ab-readout-spec-v1 s2
   s_fd_p50 = s_fd_p75 = s_fd_p90 = s_fd_p95 = 0;     // classifier-spec-v4 s5
   s_fd_n = 0;                                        // classifier-spec-v4 s5
   s_vibe_samples = 0;                                // movement-spec-v1 s5
@@ -603,6 +613,33 @@ static void prv_awake_redecide(void) {
       s_ahr_min = (uint16_t)s_anchor_scratch[0];
       s_ahr_max = (uint16_t)s_anchor_scratch[kk - 1];
     }
+    // awake-reference-ab-readout-spec-v1 s2: the WHOLE-NIGHT reference,
+    // computed EXACTLY as c-spec-v3 s3.5 specified and as this function did
+    // before v5 -- same population, same guard, same upper-middle median.
+    // COUNTERFACTUAL ONLY: no branch that affects a label reads it.
+    // s7: placed AFTER both preceding uses of s_anchor_scratch and still
+    // inside the onset guard, so nothing live occupies it. Verified from
+    // source before writing.
+    uint16_t kw = 0;
+    for (uint16_t i = onset; i < n; i++) {
+      bool still = (s_epoch_still[i >> 3] & (uint8_t)(1 << (i & 7))) != 0;
+      bool known = (s_epoch_mv_known[i >> 3] & (uint8_t)(1 << (i & 7))) != 0;
+      if (!(still && known)) continue;
+      if (s_epoch_hf[i] == 0) continue;
+      s_anchor_scratch[kw++] = (uint32_t)s_epoch_hf[i];
+    }
+    if (kw >= A_MIN_MINUTES) {
+      for (uint16_t i = 1; i < kw; i++) {
+        uint32_t key = s_anchor_scratch[i];
+        uint16_t j = i;
+        while (j > 0 && s_anchor_scratch[j - 1] > key) {
+          s_anchor_scratch[j] = s_anchor_scratch[j - 1];
+          j--;
+        }
+        s_anchor_scratch[j] = key;
+      }
+      s_ahr_whole = (uint16_t)s_anchor_scratch[kw / 2];
+    }
   }
   for (uint16_t i = 0; i < n; i++) {
     EpochRecord rec;
@@ -639,6 +676,18 @@ static void prv_awake_redecide(void) {
     // decision uses, and BEFORE any continue below, so no Awake minute at or
     // after onset can be skipped. s2: pre-onset minutes are counted in
     // NEITHER span; when onset is undefined all six stay zero.
+    // awake-reference-ab-readout-spec-v1 s2: both arms apply the IDENTICAL
+    // test and share the same margin, differing ONLY in which reference is
+    // supplied, so the comparison isolates the reference and nothing else.
+    // Counted over the SAME span the six clause counters use, and BEFORE any
+    // continue below. s3: s_ab_l MUST equal C2e + C2l + Be + Bl.
+    if (s_onset_epoch_idx >= 0 && i >= (uint16_t)s_onset_epoch_idx) {
+      if (c2) s_ab_l++;
+      if ((s_ahr_whole > 0) && (s_epoch_hf[i] > 0) &&
+          ((uint32_t)s_epoch_hf[i] * 100 > (uint32_t)s_ahr_whole * 103)) {
+        s_ab_w++;
+      }
+    }
     if ((c1 || c2) && s_onset_epoch_idx >= 0 &&
         i >= (uint16_t)s_onset_epoch_idx) {
       bool early = (i < (uint16_t)s_onset_epoch_idx + AWC_EARLY_MIN);
@@ -1312,12 +1361,30 @@ static void prv_draw_diag2(Layer *layer, GContext *ctx) {
   // classifier-spec-v5 s7: the SPREAD of the time-local reference across the
   // night. IF min == max THE REFERENCE IS NOT TRACKING AND v5 IS INERT.
   // RECORDED, NOT SCORED - no band registered before it has read once.
-  if (s_awc_a_hr_n == 0) {
-    snprintf(line, sizeof(line), "Ahr --  --");
+  // awake-reference-ab-readout-spec-v1 s6: w is the WHOLE-NIGHT reference,
+  // rendered -- when undefined. A -- there with a non-zero ABw is a
+  // CONTRADICTION and means the instrument is broken.
+  char wbuf[12];
+  if (s_ahr_whole == 0) {
+    snprintf(wbuf, sizeof(wbuf), "--");
   } else {
-    snprintf(line, sizeof(line), "Ahr %u  %u",
-      (unsigned)s_ahr_min, (unsigned)s_ahr_max);
+    snprintf(wbuf, sizeof(wbuf), "%u", (unsigned)s_ahr_whole);
   }
+  if (s_awc_a_hr_n == 0) {
+    snprintf(line, sizeof(line), "Ahr --  -- w%s", wbuf);
+  } else {
+    snprintf(line, sizeof(line), "Ahr %u  %u w%s",
+      (unsigned)s_ahr_min, (unsigned)s_ahr_max, wbuf);
+  }
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  // s2: ABw is the counterfactual count, ABl the actual. s4: ABw is NOT what
+  // Awake would have been under the old reference -- it is FIRST ORDER ONLY
+  // and every downstream effect is unmodelled. s3: ABl MUST equal the four
+  // clause counters that carry c2. RECORDED, NOT SCORED apart from that
+  // identity -- no band, and none may be registered before either has read.
+  snprintf(line, sizeof(line), "ABw %u  ABl %u",
+    (unsigned)s_ab_w, (unsigned)s_ab_l);
   graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 }
