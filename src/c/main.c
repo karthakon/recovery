@@ -1394,6 +1394,14 @@ static void prv_draw_diag2(Layer *layer, GContext *ctx) {
 // before overwriting rec.stage). READ ONLY - storage_epoch_read only, never
 // storage_epoch_update. No EpochRecord change, no new static array.
 // s2 registered identity: rem_total MUST equal the night's v_over_gate_count.
+// awake-runs-readout-spec-v1 s3: a run longer than this is tallied into one
+// REPORTED count. It comes from the USER'S SELF-REPORT, not from a
+// measurement and not from the literature. NOTHING BRANCHES ON IT -- moving
+// it would change a number that is reported and would change no stage, no
+// total, no label and no decision, which is the ONLY reason the narrow Rule 2
+// exemption applies. THE MOMENT ANY DECISION READS IT THE EXEMPTION STOPS
+// APPLYING AND IT MUST BE DERIVED. It is a TOLERANCE, not a threshold.
+#define AW_RUN_LONG 5
 typedef struct {
   uint16_t ep_n;
   uint16_t rem_total;
@@ -1419,6 +1427,17 @@ typedef struct {
   // undefined -- prints -- and NEVER 0 (measurement-spec-v1 s3.6).
   uint16_t awake_post_onset;
   bool has_awo;
+  // awake-runs-readout-spec-v1 s2: POST-smoother Awake episode structure.
+  // aw_max is the LONGEST run at or after onset -- the mid-night wake figure.
+  // aw_pre_onset is Awake BEFORE onset, a definitional artifact separated
+  // deliberately because Recovery ALWAYS starts Awake at the button press.
+  // aw_long counts runs exceeding AW_RUN_LONG. s4: all four share has_awo,
+  // because they are undefined under EXACTLY the same condition -- a second
+  // flag with identical semantics would only drift.
+  uint16_t aw_max;
+  uint16_t aw_pre_onset;
+  uint16_t aw_runs;
+  uint16_t aw_long;
 } RunStats;
 
 // Onset by the SAME ONSET_RUN 5 consecutive non-Awake rule find_onset uses
@@ -1438,6 +1457,7 @@ static void prv_compute_runs(RunStats *st) {
   int first_rem = -1;
   uint16_t onset_run = 0;
   uint16_t cur_run = 0;
+  uint16_t aw_run = 0;      // awake-runs-readout-spec-v1 s2
   uint8_t prev_pre = 0, prev_post = 0;
   bool have_prev = false;
 
@@ -1464,6 +1484,23 @@ static void prv_compute_runs(RunStats *st) {
       st->awake_post_onset++;
     }
 
+    // awake-runs-readout-spec-v1 s2: POST-smoother, from rec.stage, because
+    // RESULTS and the hypnogram are post-smoother and the self-report is a
+    // claim about what the app REPORTS. The pre-smoother count already exists
+    // as awake_post_onset and is not duplicated. A run straddling onset is
+    // counted FROM ONSET onward, so no minute is double counted.
+    if (s_onset_epoch_idx >= 0) {
+      if (t < (uint16_t)s_onset_epoch_idx) {
+        if (st_post == (uint8_t)StageAwake) st->aw_pre_onset++;
+      } else if (st_post == (uint8_t)StageAwake) {
+        aw_run++;
+      } else if (aw_run > 0) {
+        st->aw_runs++;
+        if (aw_run > st->aw_max) st->aw_max = aw_run;
+        if (aw_run > AW_RUN_LONG) st->aw_long++;
+        aw_run = 0;
+      }
+    }
     if (onset_idx < 0) {
       if (st_pre != StageAwake) {
         onset_run++;
@@ -1500,6 +1537,14 @@ static void prv_compute_runs(RunStats *st) {
     else st->r5p++;
   }
 
+  // awake-runs-readout-spec-v1 s2: a run still open at the last epoch is
+  // closed here, mirroring the REM close above. Without this a night ending
+  // Awake would drop its final -- and often longest -- run.
+  if (aw_run > 0) {
+    st->aw_runs++;
+    if (aw_run > st->aw_max) st->aw_max = aw_run;
+    if (aw_run > AW_RUN_LONG) st->aw_long++;
+  }
   if (onset_idx >= 0) st->onset_label = (int16_t)onset_idx;
   // awc-spec-v1 identity-correction 2026-08-18 s4: AwO is UNDEFINED when the
   // live immobility onset is undefined -- NOT zero. Keyed on
@@ -1581,6 +1626,27 @@ static void prv_draw_runs(Layer *layer, GContext *ctx) {
     snprintf(line, sizeof(line), "AwO %u", (unsigned)st.awake_post_onset);
   } else {
     snprintf(line, sizeof(line), "AwO --");
+  }
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  // awake-runs-readout-spec-v1 s5: AwMx is the longest Awake run at or after
+  // onset; AwP is Awake BEFORE onset, the button-press artifact, separated.
+  // s4: UNDEFINED prints -- and NEVER 0, and these inherit AwO's volatility
+  // because they key on the same RAM-only onset -- capture with DIAG-2
+  // discipline despite living here. RECORDED, NOT SCORED - no band.
+  if (st.has_awo) {
+    snprintf(line, sizeof(line), "AwMx %u  AwP %u",
+      (unsigned)st.aw_max, (unsigned)st.aw_pre_onset);
+  } else {
+    snprintf(line, sizeof(line), "AwMx --  AwP --");
+  }
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  if (st.has_awo) {
+    snprintf(line, sizeof(line), "AwR %u  Aw5 %u",
+      (unsigned)st.aw_runs, (unsigned)st.aw_long);
+  } else {
+    snprintf(line, sizeof(line), "AwR --  Aw5 --");
   }
   graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
