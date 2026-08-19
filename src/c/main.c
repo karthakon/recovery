@@ -73,6 +73,15 @@ static bool s_onset_marked;
 // classifier-spec-v3 s3.5/s4.2. A_MIN_MINUTES carried from the existing
 // s_night_hr_count >= 20. AW_MOVED_MIN is an UNWEIGHTED 3-of-5 majority.
 #define A_MIN_MINUTES 20
+// classifier-spec-v5 s3: HALF-WIDTH of the time-local reference window, in
+// minutes. DERIVED, not chosen -- a branch reads it, so Rule 2 applies IN
+// FULL and the narrow exemption does NOT apply. A full NREM-REM cycle runs
+// to about 120 minutes; a window SHORTER than a cycle would TRACK the cycle
+// rather than average over it, and since REM is autonomically similar to
+// wakefulness a short window would RAISE the reference during REM and hide
+// genuine wake there. 121 minutes is the smallest CENTRED window spanning
+// the longest typical cycle. MUST NOT be moved for any night's reading (s5).
+#define A_HR_WIN 60
 #define AW_MOVED_MIN 3
 // s_onset_mark is s_night_buf.total_accepted -- a BEAT count. s3.5 needs the
 // EPOCH index at onset, which no existing static carries. -1 until onset marks.
@@ -141,6 +150,12 @@ static uint16_t s_mv_p90 = 0;
 static uint16_t s_mv_p99 = 0;
 static uint16_t s_mv_max = 0;
 static uint16_t s_mv_n = 0;
+// classifier-spec-v5 s2: the per-minute TIME-LOCAL reference, indexed by
+// epoch. 0 means UNDEFINED for that minute and c2 CANNOT fire there -- the
+// safe direction, per c-spec-v3 s4.2. RAM only, never persisted.
+static uint16_t s_epoch_ahr[EPOCH_VAR_MAX];
+static uint16_t s_ahr_min = 0;
+static uint16_t s_ahr_max = 0;
 static uint32_t s_stop_night_var = 0;
 static uint8_t s_batt_start = 0;
 static uint8_t s_batt_end = 0;
@@ -344,6 +359,8 @@ static void prv_start_recording(void) {
   memset(s_epoch_mv_bp, 0, sizeof(s_epoch_mv_bp));   // mv-gate-spec-v1 s2
   s_moved_min = 0;                                   // mv-gate-spec-v1 s2
   s_mv_p50 = s_mv_p90 = s_mv_p99 = s_mv_max = s_mv_n = 0;
+  memset(s_epoch_ahr, 0, sizeof(s_epoch_ahr));       // classifier-spec-v5 s2
+  s_ahr_min = s_ahr_max = 0;                         // classifier-spec-v5 s7
   s_fd_p50 = s_fd_p75 = s_fd_p90 = s_fd_p95 = 0;     // classifier-spec-v4 s5
   s_fd_n = 0;                                        // classifier-spec-v4 s5
   s_vibe_samples = 0;                                // movement-spec-v1 s5
@@ -517,26 +534,39 @@ static void prv_awake_redecide(void) {
   // defined and movement STILL. STILL = still && known -- UNKNOWN is never
   // STILL (s3.1). A filters on accelerometer evidence, NOT on Awake labels,
   // which is what keeps it non-circular with the decision it feeds.
-  uint32_t a_hr = 0;
-  // awake-anchor-readout-spec-v1 s2: cleared on EVERY call so a stale value
-  // from a prior recording in the same app session can never render.
+  // classifier-spec-v5 s2: THE REFERENCE IS TIME-LOCAL. One median per minute
+  // over the CENTRED window [m - A_HR_WIN, m + A_HR_WIN], truncated at BOTH
+  // ends, restricted to minutes at or after onset with still && known movement
+  // and HF defined. THE POPULATION FILTER IS UNCHANGED FROM v3 s3.5 -- only the
+  // SCOPE changes (v5 s4), so a null result is attributable to one variable.
+  // Upper-middle element, no averaging, identical to A_H and A_D.
+  // s8: s_anchor_scratch is FREE here -- this pass runs BEFORE
+  // prv_compute_anchor, which refills it. Verified from source before writing.
+  memset(s_epoch_ahr, 0, sizeof(s_epoch_ahr));
   s_awc_a_hr = 0;
   s_awc_a_hr_n = 0;
+  s_ahr_min = 0;
+  s_ahr_max = 0;
   if (s_onset_epoch_idx >= 0) {
-    uint16_t k = 0;
-    for (uint16_t i = (uint16_t)s_onset_epoch_idx; i < n; i++) {
-      bool still = (s_epoch_still[i >> 3] & (uint8_t)(1 << (i & 7))) != 0;
-      bool known = (s_epoch_mv_known[i >> 3] & (uint8_t)(1 << (i & 7))) != 0;
-      if (!(still && known)) continue;
-      if (s_epoch_hf[i] == 0) continue;
-      s_anchor_scratch[k++] = (uint32_t)s_epoch_hf[i];
-    }
-    // awake-anchor-readout-spec-v1 s2: k is mirrored BEFORE the guard below,
-    // because a k too small to take a median IS the diagnosis when Ah is
-    // undefined. Renders its true value either way.
-    s_awc_a_hr_n = k;
-    // s3.5: fewer than A_MIN_MINUTES qualifying minutes leaves A undefined.
-    if (k >= A_MIN_MINUTES) {
+    uint16_t onset = (uint16_t)s_onset_epoch_idx;
+    for (uint16_t m = onset; m < n; m++) {
+      uint16_t lo = (m >= A_HR_WIN) ? (uint16_t)(m - A_HR_WIN) : 0;
+      if (lo < onset) lo = onset;        // s2: never reaches before onset
+      uint16_t hi = (uint16_t)(m + A_HR_WIN);
+      if (hi > n - 1) hi = (uint16_t)(n - 1);
+      uint16_t k = 0;
+      for (uint16_t i = lo; i <= hi; i++) {
+        bool still = (s_epoch_still[i >> 3] & (uint8_t)(1 << (i & 7))) != 0;
+        bool known = (s_epoch_mv_known[i >> 3] & (uint8_t)(1 << (i & 7))) != 0;
+        if (!(still && known)) continue;
+        if (s_epoch_hf[i] == 0) continue;
+        s_anchor_scratch[k++] = (uint32_t)s_epoch_hf[i];
+      }
+      // s3: A_MIN_MINUTES is CARRIED at 20 and now guards a WINDOW rather than
+      // a night, which is PROPORTIONALLY STRICTER. Where it fails the reference
+      // stays 0 == UNDEFINED and c2 cannot fire for that minute. Carrying it is
+      // a DECISION, stated in the spec, not an inheritance.
+      if (k < A_MIN_MINUTES) continue;
       for (uint16_t i = 1; i < k; i++) {
         uint32_t key = s_anchor_scratch[i];
         uint16_t j = i;
@@ -546,12 +576,34 @@ static void prv_awake_redecide(void) {
         }
         s_anchor_scratch[j] = key;
       }
-      a_hr = s_anchor_scratch[k / 2];        // upper-middle, no averaging
-      // awake-anchor-readout-spec-v1 s3: an ASSIGNMENT, not a recomputation.
-      s_awc_a_hr = (uint16_t)a_hr;
+      s_epoch_ahr[m] = (uint16_t)s_anchor_scratch[k / 2];
+    }
+    // classifier-spec-v5 s7, SUPERSEDING awake-anchor-readout-spec-v1 s2 for
+    // the MEANING of Ah and k: the reference is a SERIES now, not a scalar.
+    // Ah is its median, k the count of minutes with a defined reference, and
+    // Ahr its min and max. IF min == max THE REFERENCE IS NOT TRACKING AND
+    // THIS CHANGE IS INERT -- the cheapest available falsifier.
+    uint16_t kk = 0;
+    for (uint16_t i = 0; i < n; i++) {
+      if (s_epoch_ahr[i] == 0) continue;
+      s_anchor_scratch[kk++] = (uint32_t)s_epoch_ahr[i];
+    }
+    s_awc_a_hr_n = kk;
+    if (kk > 0) {
+      for (uint16_t i = 1; i < kk; i++) {
+        uint32_t key = s_anchor_scratch[i];
+        uint16_t j = i;
+        while (j > 0 && s_anchor_scratch[j - 1] > key) {
+          s_anchor_scratch[j] = s_anchor_scratch[j - 1];
+          j--;
+        }
+        s_anchor_scratch[j] = key;
+      }
+      s_awc_a_hr = (uint16_t)s_anchor_scratch[kk / 2];
+      s_ahr_min = (uint16_t)s_anchor_scratch[0];
+      s_ahr_max = (uint16_t)s_anchor_scratch[kk - 1];
     }
   }
-
   for (uint16_t i = 0; i < n; i++) {
     EpochRecord rec;
     if (!storage_epoch_read(i, &rec)) continue;
@@ -575,8 +627,12 @@ static void prv_awake_redecide(void) {
     // carried from sleep_stage.c's 97; its REFERENCE is not carried. When A is
     // undefined no minute is scored Awake by the HR term -- a missing baseline
     // must never make Awake EASIER to declare.
-    bool c2 = (a_hr > 0) && (s_epoch_hf[i] > 0) &&
-              ((uint32_t)s_epoch_hf[i] * 100 > a_hr * 103);
+    // classifier-spec-v5 s2: the reference is now PER-MINUTE. The 103 is NOT
+    // moved (s4) and the guard is unchanged -- an undefined reference still
+    // means c2 cannot fire, so a missing baseline never makes Awake easier.
+    uint16_t a_hr_m = s_epoch_ahr[i];
+    bool c2 = (a_hr_m > 0) && (s_epoch_hf[i] > 0) &&
+              ((uint32_t)s_epoch_hf[i] * 100 > (uint32_t)a_hr_m * 103);
 
     SleepStage ns_stage = (c1 || c2) ? StageAwake : StageLight;
     // awake-clause-counters-spec-v1 s2: counted from the SAME booleans the
@@ -1251,6 +1307,17 @@ static void prv_draw_diag2(Layer *layer, GContext *ctx) {
     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
   snprintf(line, sizeof(line), "Mvx %u  MvM %u  n %u",
     (unsigned)s_mv_max, (unsigned)s_moved_min, (unsigned)s_mv_n);
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  // classifier-spec-v5 s7: the SPREAD of the time-local reference across the
+  // night. IF min == max THE REFERENCE IS NOT TRACKING AND v5 IS INERT.
+  // RECORDED, NOT SCORED - no band registered before it has read once.
+  if (s_awc_a_hr_n == 0) {
+    snprintf(line, sizeof(line), "Ahr --  --");
+  } else {
+    snprintf(line, sizeof(line), "Ahr %u  %u",
+      (unsigned)s_ahr_min, (unsigned)s_ahr_max);
+  }
   graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 }
