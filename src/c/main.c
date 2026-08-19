@@ -124,6 +124,23 @@ static uint8_t s_epoch_still[(EPOCH_VAR_MAX + 7) / 8];
 // second RAM-only bitmap carries whether the minute had ANY accel sample.
 // STILL = still && known.  UNKNOWN = still && !known.  UNKNOWN is NEVER STILL.
 static uint8_t s_epoch_mv_known[(EPOCH_VAR_MAX + 7) / 8];
+// movement-gate-readout-spec-v1 s2: the per-minute MOVED FRACTION in
+// hundredths of a percent, 0 to 10000. The epoch gate MV_MOVED_PCT sits at
+// exactly 1000 in these units, so a reading may be compared to the gate by
+// eye. Minutes with no samples are EXCLUDED at read time via the existing
+// s_epoch_mv_known bit and are NEVER stored as a zero -- a zero would be
+// indistinguishable from a genuinely motionless minute (c-spec-v3 s3.1).
+// s5: the percentile pass SORTS THIS ARRAY IN PLACE and destroys the
+// per-minute ordering. That is acceptable ONLY because this readout is the
+// array's sole consumer. IF ANY FUTURE CHANGE READS THE PER-MINUTE SERIES,
+// THE IN-PLACE SORT MUST GO FIRST.
+static uint16_t s_epoch_mv_bp[EPOCH_VAR_MAX];
+static uint16_t s_moved_min = 0;   // minutes marked MOVED -- c1's input
+static uint16_t s_mv_p50 = 0;
+static uint16_t s_mv_p90 = 0;
+static uint16_t s_mv_p99 = 0;
+static uint16_t s_mv_max = 0;
+static uint16_t s_mv_n = 0;
 static uint32_t s_stop_night_var = 0;
 static uint8_t s_batt_start = 0;
 static uint8_t s_batt_end = 0;
@@ -194,6 +211,14 @@ static void prv_close_minute(void) {
      (uint32_t)s_mv_min_samples * MV_MOVED_PCT);
   MovementState mv = !mv_known ? MV_UNKNOWN : (movement ? MV_MOVED : MV_STILL);
   if (!mv_known) s_unknown_min++;
+  // movement-gate-readout-spec-v1 s2: taken from the SAME booleans the state
+  // assignment above uses and BEFORE any branch, so neither can disagree with
+  // the decision. Captured HERE because s_mv_min_* are zeroed a few lines
+  // below, well before the epoch index advances.
+  if (movement) s_moved_min++;
+  uint16_t mv_bp = mv_known
+    ? (uint16_t)((uint32_t)s_mv_min_moved * 10000u / s_mv_min_samples)
+    : 0;
   // movement-spec-v1 s6: RECORDED, NOT ACTED ON. Changes no decision.
   if (quiet_time_is_active()) s_qt_min++;
   SleepStage st = sleep_stage_classify(&s_minute_buf, s_night_baseline_var,
@@ -243,6 +268,11 @@ static void prv_close_minute(void) {
       s_epoch_mv_known[s_epoch_var_count >> 3] |=
         (uint8_t)(1 << (s_epoch_var_count & 7));
     }
+    // movement-gate-readout-spec-v1 s2: written at the SAME index as the two
+    // movement bits above, inside the same guard, BEFORE the count advances.
+    // Any other index would silently misalign this array against the bitmaps
+    // the percentile pass filters it with.
+    s_epoch_mv_bp[s_epoch_var_count] = mv_bp;
     s_epoch_var[s_epoch_var_count++] = hrv_mad2(&s_minute_buf);
   }
   if (s_onset_marked && s_base_sample_count < BASE_SAMPLE_MAX) {
@@ -311,6 +341,9 @@ static void prv_start_recording(void) {
   memset(s_epoch_mv_known, 0, sizeof(s_epoch_mv_known)); // c-spec-v3 s3.1
   s_veto_t2 = s_veto_t3 = s_veto_both = s_veto_none = 0;
   s_unknown_min = 0;
+  memset(s_epoch_mv_bp, 0, sizeof(s_epoch_mv_bp));   // mv-gate-spec-v1 s2
+  s_moved_min = 0;                                   // mv-gate-spec-v1 s2
+  s_mv_p50 = s_mv_p90 = s_mv_p99 = s_mv_max = s_mv_n = 0;
   s_fd_p50 = s_fd_p75 = s_fd_p90 = s_fd_p95 = 0;     // classifier-spec-v4 s5
   s_fd_n = 0;                                        // classifier-spec-v4 s5
   s_vibe_samples = 0;                                // movement-spec-v1 s5
@@ -534,7 +567,9 @@ static void prv_awake_redecide(void) {
       bool known = (s_epoch_mv_known[w >> 3] & (uint8_t)(1 << (w & 7))) != 0;
       if (known && !still) moved++;          // MOVED only; UNKNOWN is not MOVED
     }
-    // s4.2 clause 1: unweighted majority, AW_MOVED_MIN of 5.
+    // s4.2 clause 1: unweighted majority. AW_MOVED_MIN is 3 and the window is
+    // 5 wide, so this is 3-of-5 and is NOT unanimous. The prior wording read
+    // "of 5" and a continuity document carried it as 5-of-5; see the define.
     bool c1 = (moved >= AW_MOVED_MIN);
     // s4.2 clause 2: A defined, HF defined, HF(m) * 100 > A * 103. The 103 is
     // carried from sleep_stage.c's 97; its REFERENCE is not carried. When A is
@@ -691,6 +726,42 @@ static void prv_base_redecide(uint32_t anchor, uint16_t anchor_hr) {
   }
 }
 
+// movement-gate-readout-spec-v1 s2/s5. Compacts the DEFINED per-minute moved
+// fractions to the front, sorts IN PLACE, and reads the order statistics.
+// RAM ONLY -- no storage_epoch_read is added, so review finding 10's
+// stop-time watchdog concern is not engaged. Percentile INDEX convention
+// matches A_H and A_D: upper-middle, no averaging, no interpolation.
+static void prv_compute_mv_stats(void) {
+  uint16_t n = s_epoch_var_count;
+  uint16_t k = 0;
+  for (uint16_t i = 0; i < n; i++) {
+    bool known = (s_epoch_mv_known[i >> 3] & (uint8_t)(1 << (i & 7))) != 0;
+    if (!known) continue;              // s2: UNKNOWN excluded, never a zero
+    s_epoch_mv_bp[k++] = s_epoch_mv_bp[i];   // k <= i always, safe in place
+  }
+  s_mv_n = k;
+  if (k == 0) {
+    s_mv_p50 = s_mv_p90 = s_mv_p99 = s_mv_max = 0;
+    return;
+  }
+  for (uint16_t i = 1; i < k; i++) {
+    uint16_t key = s_epoch_mv_bp[i];
+    uint16_t j = i;
+    while (j > 0 && s_epoch_mv_bp[j - 1] > key) {
+      s_epoch_mv_bp[j] = s_epoch_mv_bp[j - 1];
+      j--;
+    }
+    s_epoch_mv_bp[j] = key;
+  }
+  uint32_t i90 = (uint32_t)k * 90u / 100u;
+  uint32_t i99 = (uint32_t)k * 99u / 100u;
+  if (i90 >= k) i90 = (uint32_t)k - 1u;
+  if (i99 >= k) i99 = (uint32_t)k - 1u;
+  s_mv_p50 = s_epoch_mv_bp[k / 2];
+  s_mv_p90 = s_epoch_mv_bp[i90];
+  s_mv_p99 = s_epoch_mv_bp[i99];
+  s_mv_max = s_epoch_mv_bp[k - 1];
+}
 static void prv_stop_recording(void) {
   prv_close_minute();
   s_night_baseline_var = prv_base_median();   // s3.3 whole-night BASE
@@ -706,6 +777,11 @@ static void prv_stop_recording(void) {
   s_anchor_d = anchor;
   prv_base_redecide(anchor, anchor_hr);        // s3.4, before the smoother
   prv_measure(anchor);                         // measurement-spec correction s2
+  // movement-gate-readout-spec-v1 s5: AFTER prv_measure, which is where the
+  // Fd percentiles are taken off the anchor's sorted array. This pass sorts a
+  // DIFFERENT array and contends for nothing, but the ordering is registered
+  // so it cannot be moved above prv_measure without an argument.
+  prv_compute_mv_stats();
   smoother_run(s_mins);
   s_recording = false;
   s_session_end = time(NULL);
@@ -1162,6 +1238,19 @@ static void prv_draw_diag2(Layer *layer, GContext *ctx) {
     snprintf(line, sizeof(line), "Ah %u  k %u",
       (unsigned)s_awc_a_hr, (unsigned)s_awc_a_hr_n);
   }
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  // movement-gate-readout-spec-v1 s3: the per-minute moved fraction in
+  // hundredths of a percent. The epoch gate is 1000 in these units.
+  // Mvx is the DECISIVE value: below 1000, no minute in the night could have
+  // been marked MOVED under any circumstances. MvM is c1's input.
+  // RECORDED, NOT SCORED - no band, no threshold, no expected value.
+  snprintf(line, sizeof(line), "Mv %u %u %u",
+    (unsigned)s_mv_p50, (unsigned)s_mv_p90, (unsigned)s_mv_p99);
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  snprintf(line, sizeof(line), "Mvx %u  MvM %u  n %u",
+    (unsigned)s_mv_max, (unsigned)s_moved_min, (unsigned)s_mv_n);
   graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 }
