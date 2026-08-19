@@ -87,6 +87,16 @@ static uint32_t s_night_baseline_var = 0;
 static uint16_t s_anchor_hr = 0;
 static uint16_t s_anchor_hr_n = 0;
 static uint32_t s_anchor_d = 0;
+// awake-anchor-readout-spec-v1 s1: c2's reference a_hr is a LOCAL in
+// prv_awake_redecide with no static, no persist site and no render site. It is
+// NOT s_anchor_hr above -- different function, different population (s3.5
+// still && known from onset, vs s3.4 non-Awake whole night), and neither may
+// substitute for the other. NOT recoverable retroactively: a_hr depends on the
+// RAM-only movement bitmaps and EpochRecord carries no movement field.
+// RAM-only mirrors for the DIAG 2 readout. s_awc_a_hr 0 means UNDEFINED, so
+// DIAG 2 prints -- for 0 on that line. Not persisted, not in NightSummary.
+static uint16_t s_awc_a_hr = 0;
+static uint16_t s_awc_a_hr_n = 0;
 // classifier-spec-v2 s4: among minutes that clear T1 (v > 2*A_D), which of the
 // other two terms vetoed. A complete partition of the T1-admitted set AS
 // prv_base_redecide SEES IT -- NOT guaranteed to sum to Gate, because prv_measure
@@ -475,6 +485,10 @@ static void prv_awake_redecide(void) {
   // STILL (s3.1). A filters on accelerometer evidence, NOT on Awake labels,
   // which is what keeps it non-circular with the decision it feeds.
   uint32_t a_hr = 0;
+  // awake-anchor-readout-spec-v1 s2: cleared on EVERY call so a stale value
+  // from a prior recording in the same app session can never render.
+  s_awc_a_hr = 0;
+  s_awc_a_hr_n = 0;
   if (s_onset_epoch_idx >= 0) {
     uint16_t k = 0;
     for (uint16_t i = (uint16_t)s_onset_epoch_idx; i < n; i++) {
@@ -484,6 +498,10 @@ static void prv_awake_redecide(void) {
       if (s_epoch_hf[i] == 0) continue;
       s_anchor_scratch[k++] = (uint32_t)s_epoch_hf[i];
     }
+    // awake-anchor-readout-spec-v1 s2: k is mirrored BEFORE the guard below,
+    // because a k too small to take a median IS the diagnosis when Ah is
+    // undefined. Renders its true value either way.
+    s_awc_a_hr_n = k;
     // s3.5: fewer than A_MIN_MINUTES qualifying minutes leaves A undefined.
     if (k >= A_MIN_MINUTES) {
       for (uint16_t i = 1; i < k; i++) {
@@ -496,6 +514,8 @@ static void prv_awake_redecide(void) {
         s_anchor_scratch[j] = key;
       }
       a_hr = s_anchor_scratch[k / 2];        // upper-middle, no averaging
+      // awake-anchor-readout-spec-v1 s3: an ASSIGNMENT, not a recomputation.
+      s_awc_a_hr = (uint16_t)a_hr;
     }
   }
 
@@ -1128,6 +1148,20 @@ static void prv_draw_diag2(Layer *layer, GContext *ctx) {
   snprintf(line, sizeof(line), "C1l %u C2l %u Bl %u",
     (unsigned)s_awc_c1_late, (unsigned)s_awc_c2_late,
     (unsigned)s_awc_both_late);
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  // awake-anchor-readout-spec-v1 s4: Ah is c2's reference and k its
+  // population. Label is Ah and NOT AH deliberately -- AH on DIAG 1 is the
+  // OTHER anchor and a reader who confuses them draws the wrong conclusion.
+  // s2: Ah prints -- when undefined and NEVER 0; when Ah is --, c2 CANNOT
+  // have fired at all, so non-zero counters would mean c1 produced them.
+  // RECORDED, NOT SCORED - no band, no threshold, no expected value.
+  if (s_awc_a_hr == 0) {
+    snprintf(line, sizeof(line), "Ah --  k %u", (unsigned)s_awc_a_hr_n);
+  } else {
+    snprintf(line, sizeof(line), "Ah %u  k %u",
+      (unsigned)s_awc_a_hr, (unsigned)s_awc_a_hr_n);
+  }
   graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 }
