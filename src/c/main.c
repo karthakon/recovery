@@ -359,7 +359,7 @@ static void prv_health_handler(HealthEventType event, void *context) {
       s_last_hr = (uint16_t)hr;
       s_last_hr_time = (uint32_t)time(NULL);
     }
-  } else if ((int)event == 5) {
+  } else if (event == HealthEventHRVUpdate) {
     s_hrv_events++;
     uint16_t ppi = (uint16_t)health_service_peek_hrv_ppi_ms();
     if (ppi > 0) {
