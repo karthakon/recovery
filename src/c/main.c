@@ -83,6 +83,17 @@ static bool s_onset_marked;
 // the longest typical cycle. MUST NOT be moved for any night's reading (s5).
 #define A_HR_WIN 60
 #define AW_MOVED_MIN 3
+// stillness-run-readout-spec-v1 s3: minimum length of a stillness run, in
+// minutes. DERIVED from submental EMG work reporting that muscle tone begins
+// dropping ABOUT FIVE MINUTES BEFORE a REM episode, with recovery over the
+// following twenty. The actigraphy immobility figure is CORROBORATION ONLY and
+// is calibrated for ONSET DETECTION, not REM candidacy. SLEEP_ONSET_MINUTES is
+// NOT a third source -- it IS the actigraphy one (c-spec-v3 s1).
+// THE WEAKNESS IS REGISTERED IN s3: the primary derivation rests on ONE
+// retrieved line of work, and if a second on-purpose source disagrees the
+// constant is re-derived in a dated correction. NOTHING BRANCHES ON IT IN A
+// WAY THAT CHANGES A STAGE -- it selects which runs are tallied.
+#define STILL_RUN_MIN 5
 // s_onset_mark is s_night_buf.total_accepted -- a BEAT count. s3.5 needs the
 // EPOCH index at onset, which no existing static carries. -1 until onset marks.
 static int32_t s_onset_epoch_idx = -1;
@@ -150,6 +161,23 @@ static uint16_t s_mv_p90 = 0;
 static uint16_t s_mv_p99 = 0;
 static uint16_t s_mv_max = 0;
 static uint16_t s_mv_n = 0;
+// stillness-run-readout-spec-v1 s2: a STILLNESS RUN is a maximal consecutive
+// sequence of minutes that are BOTH still AND known, read from the movement
+// bitmaps DIRECTLY and NEVER from stage labels -- c-spec-v3 s1 identifies that
+// circularity and it applies here unchanged. UNKNOWN BREAKS A RUN exactly as
+// MOVED does, inherited from the onset rule (c-spec-v3 s3.4), because a run
+// bridged across minutes carrying no evidence is not a run.
+// s_epoch_in_run marks minutes sitting inside a run of >= STILL_RUN_MIN.
+static uint8_t s_epoch_in_run[(EPOCH_VAR_MAX + 7) / 8];
+static uint16_t s_sr_p50 = 0;
+static uint16_t s_sr_p90 = 0;
+static uint16_t s_sr_max = 0;
+static uint16_t s_sr_n = 0;      // number of stillness runs
+static uint16_t s_sr_long = 0;   // how many reach STILL_RUN_MIN
+// s4: THE DECISIVE PAIR. c2n counts post-onset minutes the heart-rate clause
+// claimed; c2s how many of those sit INSIDE a run of >= STILL_RUN_MIN.
+static uint16_t s_c2_still = 0;
+static uint16_t s_c2_total = 0;
 // classifier-spec-v5 s2: the per-minute TIME-LOCAL reference, indexed by
 // epoch. 0 means UNDEFINED for that minute and c2 CANNOT fire there -- the
 // safe direction, per c-spec-v3 s4.2. RAM only, never persisted.
@@ -173,7 +201,7 @@ static uint16_t s_mins[4] = {0, 0, 0, 0};
 static uint8_t s_awake_streak = 0;
 static SleepStage s_last_stage = StageLight;
 static AppTimer *s_ui_timer = NULL;
-typedef enum { MODE_IDLE, MODE_RECORDING, MODE_RESULTS, MODE_HYPNO, MODE_HISTORY, MODE_DIAG, MODE_DIAG2, MODE_RUNS } ScreenMode;
+typedef enum { MODE_IDLE, MODE_RECORDING, MODE_RESULTS, MODE_HYPNO, MODE_HISTORY, MODE_DIAG, MODE_DIAG2, MODE_DIAG3, MODE_RUNS } ScreenMode;
 static ScreenMode s_mode = MODE_IDLE;
 static uint8_t s_hist_idx = 0;      // 0 = newest
 static uint8_t s_hist_count = 0;    // populated nights at entry
@@ -367,6 +395,9 @@ static void prv_start_recording(void) {
   memset(s_epoch_mv_bp, 0, sizeof(s_epoch_mv_bp));   // mv-gate-spec-v1 s2
   s_moved_min = 0;                                   // mv-gate-spec-v1 s2
   s_mv_p50 = s_mv_p90 = s_mv_p99 = s_mv_max = s_mv_n = 0;
+  memset(s_epoch_in_run, 0, sizeof(s_epoch_in_run));  // still-run-spec-v1 s2
+  s_sr_p50 = s_sr_p90 = s_sr_max = s_sr_n = s_sr_long = 0;
+  s_c2_still = s_c2_total = 0;                        // still-run-spec-v1 s4
   memset(s_epoch_ahr, 0, sizeof(s_epoch_ahr));       // classifier-spec-v5 s2
   s_ahr_min = s_ahr_max = 0;                         // classifier-spec-v5 s7
   s_ahr_whole = 0;                                   // ab-readout-spec-v1 s2
@@ -535,6 +566,58 @@ static void prv_awake_redecide(void) {
   uint16_t n = storage_epoch_count();
   if (n > s_epoch_var_count) n = s_epoch_var_count;
   if (n == 0) return;
+  // stillness-run-readout-spec-v1 s2: build the stillness runs BEFORE the
+  // decision loop, which reads s_epoch_in_run. Runs come from the movement
+  // bitmaps ONLY -- never from stage labels (s2, and c-spec-v3 s1's
+  // circularity). UNKNOWN breaks a run exactly as MOVED does.
+  // s4: order statistics over run LENGTHS. Upper-middle element, no averaging
+  // and no interpolation, identical to A_H, A_D and the movement readout.
+  // This pass writes s_anchor_scratch, which is FREE here -- prv_compute_anchor
+  // refills it later and the two uses below it run after this returns.
+  // Verified from source before writing.
+  {
+    uint16_t run_start = 0;
+    uint16_t run_len = 0;
+    uint16_t rc = 0;
+    for (uint16_t i = 0; i <= n; i++) {
+      bool ok = false;
+      if (i < n) {
+        bool still = (s_epoch_still[i >> 3] & (uint8_t)(1 << (i & 7))) != 0;
+        bool known = (s_epoch_mv_known[i >> 3] & (uint8_t)(1 << (i & 7))) != 0;
+        ok = still && known;
+      }
+      if (ok) {
+        if (run_len == 0) run_start = i;
+        run_len++;
+      } else if (run_len > 0) {
+        s_anchor_scratch[rc++] = (uint32_t)run_len;
+        if (run_len >= STILL_RUN_MIN) {
+          s_sr_long++;
+          for (uint16_t t = run_start; t < run_start + run_len; t++) {
+            s_epoch_in_run[t >> 3] |= (uint8_t)(1 << (t & 7));
+          }
+        }
+        run_len = 0;
+      }
+    }
+    s_sr_n = rc;
+    if (rc > 0) {
+      for (uint16_t i = 1; i < rc; i++) {
+        uint32_t key = s_anchor_scratch[i];
+        uint16_t j = i;
+        while (j > 0 && s_anchor_scratch[j - 1] > key) {
+          s_anchor_scratch[j] = s_anchor_scratch[j - 1];
+          j--;
+        }
+        s_anchor_scratch[j] = key;
+      }
+      uint16_t i90 = (uint16_t)(((uint32_t)rc * 90) / 100);
+      if (i90 >= rc) i90 = (uint16_t)(rc - 1);
+      s_sr_p50 = (uint16_t)s_anchor_scratch[rc / 2];
+      s_sr_p90 = (uint16_t)s_anchor_scratch[i90];
+      s_sr_max = (uint16_t)s_anchor_scratch[rc - 1];
+    }
+  }
 
   // s3.3: HF(m), same window shape as F(m). prv_compute_anchor refills
   // s_epoch_hf identically before it uses it, so filling it here is safe.
@@ -681,6 +764,16 @@ static void prv_awake_redecide(void) {
     // supplied, so the comparison isolates the reference and nothing else.
     // Counted over the SAME span the six clause counters use, and BEFORE any
     // continue below. s3: s_ab_l MUST equal C2e + C2l + Be + Bl.
+    // stillness-run-readout-spec-v1 s4: c2n counts post-onset minutes the
+    // heart-rate clause claimed; c2s how many of those sit INSIDE a stillness
+    // run of >= STILL_RUN_MIN. Counted from the SAME c2 boolean the decision
+    // uses, over the SAME span as the clause counters, and BEFORE any continue
+    // below. RECORDED, NOT SCORED -- no band, and no criterion may be
+    // registered against them until they have read once (s9).
+    if (c2 && s_onset_epoch_idx >= 0 && i >= (uint16_t)s_onset_epoch_idx) {
+      s_c2_total++;
+      if ((s_epoch_in_run[i >> 3] & (uint8_t)(1 << (i & 7))) != 0) s_c2_still++;
+    }
     if (s_onset_epoch_idx >= 0 && i >= (uint16_t)s_onset_epoch_idx) {
       if (c2) s_ab_l++;
       if ((s_ahr_whole > 0) && (s_epoch_hf[i] > 0) &&
@@ -1345,19 +1438,6 @@ static void prv_draw_diag2(Layer *layer, GContext *ctx) {
   }
   graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
-  // movement-gate-readout-spec-v1 s3: the per-minute moved fraction in
-  // hundredths of a percent. The epoch gate is 1000 in these units.
-  // Mvx is the DECISIVE value: below 1000, no minute in the night could have
-  // been marked MOVED under any circumstances. MvM is c1's input.
-  // RECORDED, NOT SCORED - no band, no threshold, no expected value.
-  snprintf(line, sizeof(line), "Mv %u %u %u",
-    (unsigned)s_mv_p50, (unsigned)s_mv_p90, (unsigned)s_mv_p99);
-  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
-    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
-  snprintf(line, sizeof(line), "Mvx %u  MvM %u  n %u",
-    (unsigned)s_mv_max, (unsigned)s_moved_min, (unsigned)s_mv_n);
-  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
-    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
   // classifier-spec-v5 s7: the SPREAD of the time-local reference across the
   // night. IF min == max THE REFERENCE IS NOT TRACKING AND v5 IS INERT.
   // RECORDED, NOT SCORED - no band registered before it has read once.
@@ -1444,6 +1524,68 @@ typedef struct {
 // (smoother.c lines 93-106), applied over reserved. -1 if none.
 #define RUNS_ONSET_RUN 5
 
+// DIAG 3. stillness-run-readout-spec-v1 s5: DIAG 2 and RUNS were both FULL at
+// eleven lines and the recorded overflow sits just beyond eleven, so a twelfth
+// line was not available. A redundancy audit of all three diagnostic screens
+// found NOTHING removable -- the one cross-screen duplication (the Fd median
+// against the T1 anchor) is deliberate and a conditioning check scores it.
+// The movement lines MOVE here rather than staying behind, because the moved
+// fraction and the run structure are two halves of one question and reading
+// them off different screens invites the label-collision error. This leaves
+// DIAG 2 at NINE lines, a height already proven to fit. UP/BACK return.
+static void prv_draw_diag3(Layer *layer, GContext *ctx) {
+  GRect b = layer_get_bounds(layer);
+  graphics_context_set_text_color(ctx, GColorBlack);
+  char line[64];
+  int y = 2;
+  GFont f = fonts_get_system_font(FONT_KEY_GOTHIC_14);
+  snprintf(line, sizeof(line), "Diag 3");
+  graphics_draw_text(ctx, line, fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
+    GRect(4, y, b.size.w - 8, 26), GTextOverflowModeTrailingEllipsis,
+    GTextAlignmentLeft, NULL); y += 26;
+  // movement-gate-readout-spec-v1 s3: the per-minute moved fraction in
+  // hundredths of a percent. The epoch gate is 1000 in these units.
+  // Mvx is the DECISIVE value: below 1000, no minute in the night could have
+  // been marked MOVED under any circumstances. MvM is c1's input.
+  // RECORDED, NOT SCORED - no band, no threshold, no expected value.
+  snprintf(line, sizeof(line), "Mv %u %u %u",
+    (unsigned)s_mv_p50, (unsigned)s_mv_p90, (unsigned)s_mv_p99);
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  snprintf(line, sizeof(line), "Mvx %u  MvM %u  n %u",
+    (unsigned)s_mv_max, (unsigned)s_moved_min, (unsigned)s_mv_n);
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  // stillness-run-readout-spec-v1 s4: the run-length distribution in minutes.
+  // UNDEFINED prints -- and NEVER 0 (measurement-spec-v1 s3.6). Sr5 0 with a
+  // defined SrN is a REAL ZERO -- runs existed and none reached the threshold,
+  // which is a finding and not a gap.
+  if (s_sr_n == 0) {
+    snprintf(line, sizeof(line), "Sr --  --  --");
+  } else {
+    snprintf(line, sizeof(line), "Sr %u %u %u",
+      (unsigned)s_sr_p50, (unsigned)s_sr_p90, (unsigned)s_sr_max);
+  }
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  snprintf(line, sizeof(line), "SrN %u  Sr5 %u",
+    (unsigned)s_sr_n, (unsigned)s_sr_long);
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  // s4: THE DECISIVE PAIR, and they key on the RAM-only live onset index so
+  // they read -- after an app restart exactly as the other onset-keyed values
+  // do. CAPTURED LIVE OR LOST. The FRACTION is deliberately NOT rendered --
+  // both inputs are on the screen and deriving it at scoring time is not a
+  // Rule 6 violation, the same reasoning the anchor readout gives.
+  if (s_onset_epoch_idx >= 0) {
+    snprintf(line, sizeof(line), "C2s %u  C2n %u",
+      (unsigned)s_c2_still, (unsigned)s_c2_total);
+  } else {
+    snprintf(line, sizeof(line), "C2s --  C2n --");
+  }
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+}
 static void prv_compute_runs(RunStats *st) {
   memset(st, 0, sizeof(*st));
   st->first_off = 0;
@@ -1659,6 +1801,7 @@ static void prv_canvas_update(Layer *layer, GContext *ctx) {
     case MODE_HYPNO:     prv_draw_hypno(layer, ctx);     break;
     case MODE_DIAG:      prv_draw_diag(layer, ctx);      break;
     case MODE_DIAG2:     prv_draw_diag2(layer, ctx);     break;
+    case MODE_DIAG3:     prv_draw_diag3(layer, ctx);     break;
     case MODE_RUNS:      prv_draw_runs(layer, ctx);      break;
     case MODE_HISTORY:   prv_draw_history(layer, ctx);   break;
     case MODE_IDLE:
@@ -1757,6 +1900,16 @@ static void prv_diag_to_diag2(ClickRecognizerRef r, void *ctx) {
   window_set_click_config_provider(s_window, prv_click_config);
   layer_mark_dirty(s_canvas);
 }
+static void prv_diag2_to_diag3(ClickRecognizerRef r, void *ctx) {
+  s_mode = MODE_DIAG3;
+  window_set_click_config_provider(s_window, prv_click_config);
+  layer_mark_dirty(s_canvas);
+}
+static void prv_diag3_to_diag2(ClickRecognizerRef r, void *ctx) {
+  s_mode = MODE_DIAG2;
+  window_set_click_config_provider(s_window, prv_click_config);
+  layer_mark_dirty(s_canvas);
+}
 static void prv_diag2_to_diag(ClickRecognizerRef r, void *ctx) {
   s_mode = MODE_DIAG;
   window_set_click_config_provider(s_window, prv_click_config);
@@ -1802,7 +1955,12 @@ static void prv_click_config(void *ctx) {
       break;
     case MODE_DIAG2:
       window_single_click_subscribe(BUTTON_ID_UP, prv_diag2_to_diag);
+      window_single_click_subscribe(BUTTON_ID_DOWN, prv_diag2_to_diag3);
       window_single_click_subscribe(BUTTON_ID_BACK, prv_diag2_to_diag);
+      break;
+    case MODE_DIAG3:
+      window_single_click_subscribe(BUTTON_ID_UP, prv_diag3_to_diag2);
+      window_single_click_subscribe(BUTTON_ID_BACK, prv_diag3_to_diag2);
       break;
     case MODE_RUNS:
       window_single_click_subscribe(BUTTON_ID_UP, prv_runs_to_idle);
