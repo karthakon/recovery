@@ -9,6 +9,16 @@ static Layer *s_canvas;
 static bool s_recording = false;
 static uint32_t s_hr_events = 0;
 static uint32_t s_hrv_events = 0;
+// hrv-cadence-spec-v1 s2: SESSION-scoped, distinct from s_hrv_events which is
+// APP-LIFETIME and rendered on IDLE's ev line. Identity: He == Hn + Hx.
+static uint32_t s_he = 0;
+static uint32_t s_hx = 0;
+static uint32_t s_hn = 0;
+static uint32_t s_hd = 0;
+// recording-gate-correction s2: the Hd reference is NEW, session-scoped and
+// GATED. s_last_ppi is app-lifetime and unreset, so it must NOT be used; an
+// ungated reference would carry a post-stop value into the next session.
+static uint16_t s_hd_prev = 0;
 // movement-spec-v1 s3: accelerometer data SUBSCRIPTION, 10Hz / 25 samples.
 // accel_service_peek CANNOT be used while subscribed (pebble.h 769,789).
 // mag2 in milli-g squared; 1g rest == 1000000. Display-only for now.
@@ -361,8 +371,16 @@ static void prv_health_handler(HealthEventType event, void *context) {
     }
   } else if (event == HealthEventHRVUpdate) {
     s_hrv_events++;
+    // recording-gate-correction s2: ALL FOUR counters gated on s_recording.
+    // s_hrv_events above is app-lifetime and deliberately NOT gated.
+    if (s_recording) s_he++;
     uint16_t ppi = (uint16_t)health_service_peek_hrv_ppi_ms();
     if (ppi > 0) {
+      if (s_recording) {
+        s_hn++;
+        if (ppi == s_hd_prev) s_hd++;                // BEFORE s_last_ppi
+        s_hd_prev = ppi;
+      }
       s_last_ppi = ppi;
       uint32_t now = (uint32_t)time(NULL);
       hrv_buf_add(&s_live_buf, ppi, 1, now);
@@ -370,6 +388,8 @@ static void prv_health_handler(HealthEventType event, void *context) {
         hrv_buf_add(&s_minute_buf, ppi, 1, now);
         hrv_buf_add(&s_night_buf, ppi, 1, now);
       }
+    } else {
+      if (s_recording) s_hx++;                       // recording-gate s2
     }
   }
   if (s_mode == MODE_IDLE) layer_mark_dirty(s_canvas);
@@ -398,6 +418,8 @@ static void prv_start_recording(void) {
   memset(s_epoch_in_run, 0, sizeof(s_epoch_in_run));  // still-run-spec-v1 s2
   s_sr_p50 = s_sr_p90 = s_sr_max = s_sr_n = s_sr_long = 0;
   s_c2_still = s_c2_total = 0;                        // still-run-spec-v1 s4
+  s_he = s_hx = s_hn = s_hd = 0;                     // hrv-cadence-spec-v1 s3
+  s_hd_prev = 0;                                     // hrv-cadence-spec-v1 s3
   memset(s_epoch_ahr, 0, sizeof(s_epoch_ahr));       // classifier-spec-v5 s2
   s_ahr_min = s_ahr_max = 0;                         // classifier-spec-v5 s7
   s_ahr_whole = 0;                                   // ab-readout-spec-v1 s2
@@ -1582,6 +1604,26 @@ static void prv_draw_diag3(Layer *layer, GContext *ctx) {
       (unsigned)s_c2_still, (unsigned)s_c2_total);
   } else {
     snprintf(line, sizeof(line), "C2s --  C2n --");
+  }
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  // hrv-cadence-spec-v1 s4/s5: the session HRV delivery cadence. Guard keys on
+  // s_session_start, NOT s_recording -- the values must still read after stop.
+  // A DEFINED He of 0 is a REAL ZERO and is a finding (s5).
+  // Identity He == Hn + Hx (s2). Hd BOUNDS duplication from above (s6).
+  if (s_session_start == 0) {
+    snprintf(line, sizeof(line), "He --  Hx --");
+  } else {
+    snprintf(line, sizeof(line), "He %lu  Hx %lu",
+      (unsigned long)s_he, (unsigned long)s_hx);
+  }
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  if (s_session_start == 0) {
+    snprintf(line, sizeof(line), "Hn --  Hd --");
+  } else {
+    snprintf(line, sizeof(line), "Hn %lu  Hd %lu",
+      (unsigned long)s_hn, (unsigned long)s_hd);
   }
   graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
