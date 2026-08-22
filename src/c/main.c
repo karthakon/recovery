@@ -19,6 +19,22 @@ static uint32_t s_hd = 0;
 // GATED. s_last_ppi is app-lifetime and unreset, so it must NOT be used; an
 // ungated reference would carry a post-stop value into the next session.
 static uint16_t s_hd_prev = 0;
+// rsa-feasibility-spec-v1 s3/s4: SESSION-scoped, defined over s_night_buf and
+// NOTHING ELSE. The gates are PER-BUFFER, not per-event -- each HrvBuffer keeps
+// its own last_accepted and last_accepted_time -- so a counter that does not
+// name its buffer is meaningless. s_live_buf is UNGATED and s_minute_buf resets
+// every minute; neither can see a session-long discontinuity.
+// Identity (s4): Gn <= Gp + Gs + 1.
+static uint32_t s_gp = 0;           // accepted whose PREDECESSOR was rejected
+static uint32_t s_gs = 0;           // accepted > HRV_STALE_SEC after previous
+static uint32_t s_gmx = 0;          // longest clean run, in beats
+static uint32_t s_gn = 0;           // number of clean runs
+// s4: s_g_prev_rej records the PREVIOUS s_night_buf call's return value.
+// hrv_buf_add ALREADY returns false on rejection (hrv_math.c 22,36) and the
+// caller discarded it. NO GATE CHANGES AND NO NEW CONSTANT IS INTRODUCED.
+static bool s_g_prev_rej = false;
+static uint32_t s_g_run = 0;        // current clean run length, in beats
+static uint32_t s_g_prev_t = 0;     // time of last interval ACCEPTED to night_buf
 // movement-spec-v1 s3: accelerometer data SUBSCRIPTION, 10Hz / 25 samples.
 // accel_service_peek CANNOT be used while subscribed (pebble.h 769,789).
 // mag2 in milli-g squared; 1g rest == 1000000. Display-only for now.
@@ -386,7 +402,28 @@ static void prv_health_handler(HealthEventType event, void *context) {
       hrv_buf_add(&s_live_buf, ppi, 1, now);
       if (s_recording) {
         hrv_buf_add(&s_minute_buf, ppi, 1, now);
-        hrv_buf_add(&s_night_buf, ppi, 1, now);
+        // rsa-feasibility-spec-v1 s3: ONLY s_night_buf's verdict is counted.
+        bool acc = hrv_buf_add(&s_night_buf, ppi, 1, now);
+        if (acc) {
+          // s4: a GAP is > HRV_STALE_SEC since the last interval accepted into
+          // THIS buffer. s_g_prev_t is 0 for the first accepted interval of the
+          // session, which is not a gap and not a discard-adjacency.
+          bool gap = (s_g_prev_t > 0) && ((now - s_g_prev_t) > HRV_STALE_SEC);
+          if (gap) s_gs++;
+          if (s_g_prev_rej) s_gp++;
+          if (gap || s_g_prev_rej) {
+            // A clean run ENDS here. Close it before starting the next.
+            if (s_g_run > 0) {
+              s_gn++;
+              if (s_g_run > s_gmx) s_gmx = s_g_run;
+            }
+            s_g_run = 1;
+          } else {
+            s_g_run++;
+          }
+          s_g_prev_t = now;
+        }
+        s_g_prev_rej = !acc;
       }
     } else {
       if (s_recording) s_hx++;                       // recording-gate s2
@@ -420,6 +457,10 @@ static void prv_start_recording(void) {
   s_c2_still = s_c2_total = 0;                        // still-run-spec-v1 s4
   s_he = s_hx = s_hn = s_hd = 0;                     // hrv-cadence-spec-v1 s3
   s_hd_prev = 0;                                     // hrv-cadence-spec-v1 s3
+  s_gp = s_gs = s_gmx = s_gn = 0;                    // rsa-feasibility-spec-v1 s4
+  s_g_prev_rej = false;                              // rsa-feasibility-spec-v1 s4
+  s_g_run = 0;                                       // rsa-feasibility-spec-v1 s4
+  s_g_prev_t = 0;                                    // rsa-feasibility-spec-v1 s4
   memset(s_epoch_ahr, 0, sizeof(s_epoch_ahr));       // classifier-spec-v5 s2
   s_ahr_min = s_ahr_max = 0;                         // classifier-spec-v5 s7
   s_ahr_whole = 0;                                   // ab-readout-spec-v1 s2
@@ -1624,6 +1665,33 @@ static void prv_draw_diag3(Layer *layer, GContext *ctx) {
   } else {
     snprintf(line, sizeof(line), "Hn %lu  Hd %lu",
       (unsigned long)s_hn, (unsigned long)s_hd);
+  }
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  // rsa-feasibility-spec-v1 s5: guard keys on s_session_start, NOT s_recording,
+  // so the values still read after stop -- identical to the cadence lines above.
+  // A DEFINED Gp of 0 is a REAL ZERO and is a finding (s5). NO fraction and no
+  // rate is rendered; both inputs of every ratio are on the screen and
+  // rec_duration_min supplies duration, so deriving at scoring time is not a
+  // Rule 6 violation. Gmx/Gn are the pair that distinguish CLUSTERED discards
+  // from scattered ones; Gp alone cannot (s7).
+  if (s_session_start == 0) {
+    snprintf(line, sizeof(line), "Gp --  Gs --");
+  } else {
+    snprintf(line, sizeof(line), "Gp %lu  Gs %lu",
+      (unsigned long)s_gp, (unsigned long)s_gs);
+  }
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  if (s_session_start == 0) {
+    snprintf(line, sizeof(line), "Gmx --  Gn --");
+  } else {
+    // s4: the FINAL run is still open at render time and is included here so
+    // Gmx and Gn describe the whole session. This does NOT mutate the counters.
+    uint32_t gmx_r = (s_g_run > s_gmx) ? s_g_run : s_gmx;
+    uint32_t gn_r = (s_g_run > 0) ? (s_gn + 1) : s_gn;
+    snprintf(line, sizeof(line), "Gmx %lu  Gn %lu",
+      (unsigned long)gmx_r, (unsigned long)gn_r);
   }
   graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
