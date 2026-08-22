@@ -29,6 +29,31 @@ static uint32_t s_gp = 0;           // accepted whose PREDECESSOR was rejected
 static uint32_t s_gs = 0;           // accepted > HRV_STALE_SEC after previous
 static uint32_t s_gmx = 0;          // longest clean run, in beats
 static uint32_t s_gn = 0;           // number of clean runs
+// hrv-resolution-spec-v1 s4: SESSION-scoped, defined over s_night_buf ONLY.
+// INSTRUMENT ONLY -- no decision, no stage, no total, no stored field.
+// s_d2..s_d10 count ACCEPTED intervals divisible by each divisor. s_dn is this
+// instrument's OWN denominator, incremented at the same site so all six share
+// one increment path and one scope, which is what makes the s4 nesting
+// identities checkable from the rendered values alone (s4).
+static uint32_t s_d2 = 0;
+static uint32_t s_d4 = 0;
+static uint32_t s_d5 = 0;
+static uint32_t s_d8 = 0;
+static uint32_t s_d10 = 0;
+static uint32_t s_dn = 0;
+// s4: SMALLEST NON-ZERO absolute difference between CONSECUTIVE ACCEPTED
+// intervals. Bounds the quantisation step WITHOUT enumerating divisors, so a
+// 3, 7, 20 or 50 ms step is detectable where the divisor set cannot reach it.
+// Seeded above any possible interval; renders -- if never lowered (s5).
+// A rendered Dm of 0 IS AN INSTRUMENT DEFECT: zero differences are excluded by
+// construction (they are the quantity Hd already counts).
+#define DM_SENTINEL 65535u
+static uint32_t s_dm = DM_SENTINEL;
+// s4: the previous ACCEPTED interval's VALUE. Deliberately NOT s_hd_prev,
+// which is assigned on every ppi > 0 event whether accepted or rejected --
+// using that would compute differences ACROSS rejected beats and would measure
+// a different quantity than the spec defines.
+static uint16_t s_dm_prev = 0;
 // s4: s_g_prev_rej records the PREVIOUS s_night_buf call's return value.
 // hrv_buf_add ALREADY returns false on rejection (hrv_math.c 22,36) and the
 // caller discarded it. NO GATE CHANGES AND NO NEW CONSTANT IS INTRODUCED.
@@ -227,7 +252,7 @@ static uint16_t s_mins[4] = {0, 0, 0, 0};
 static uint8_t s_awake_streak = 0;
 static SleepStage s_last_stage = StageLight;
 static AppTimer *s_ui_timer = NULL;
-typedef enum { MODE_IDLE, MODE_RECORDING, MODE_RESULTS, MODE_HYPNO, MODE_HISTORY, MODE_DIAG, MODE_DIAG2, MODE_DIAG3, MODE_RUNS } ScreenMode;
+typedef enum { MODE_IDLE, MODE_RECORDING, MODE_RESULTS, MODE_HYPNO, MODE_HISTORY, MODE_DIAG, MODE_DIAG2, MODE_DIAG3, MODE_DIAG4, MODE_RUNS } ScreenMode;
 static ScreenMode s_mode = MODE_IDLE;
 static uint8_t s_hist_idx = 0;      // 0 = newest
 static uint8_t s_hist_count = 0;    // populated nights at entry
@@ -422,6 +447,25 @@ static void prv_health_handler(HealthEventType event, void *context) {
             s_g_run++;
           }
           s_g_prev_t = now;
+          // hrv-resolution-spec-v1 s4: accumulated PER BEAT as intervals are
+          // accepted, NOT computed at render time -- ppi[] slides and holds
+          // only the last HRV_BUF_MAX intervals, so a histogram taken at stop
+          // would describe the last 400 beats and NOT the night. That is the
+          // last-400-beat scope error next-action 13 records and it must not
+          // be reintroduced in a new instrument.
+          s_dn++;
+          if (ppi % 2 == 0) s_d2++;
+          if (ppi % 4 == 0) s_d4++;
+          if (ppi % 5 == 0) s_d5++;
+          if (ppi % 8 == 0) s_d8++;
+          if (ppi % 10 == 0) s_d10++;
+          // s4: consecutive ACCEPTED pairs only; zero differences EXCLUDED.
+          if (s_dm_prev > 0) {
+            uint32_t d = (ppi > s_dm_prev) ? (uint32_t)(ppi - s_dm_prev)
+                                           : (uint32_t)(s_dm_prev - ppi);
+            if (d > 0 && d < s_dm) s_dm = d;
+          }
+          s_dm_prev = ppi;
         }
         s_g_prev_rej = !acc;
       }
@@ -461,6 +505,9 @@ static void prv_start_recording(void) {
   s_g_prev_rej = false;                              // rsa-feasibility-spec-v1 s4
   s_g_run = 0;                                       // rsa-feasibility-spec-v1 s4
   s_g_prev_t = 0;                                    // rsa-feasibility-spec-v1 s4
+  s_d2 = s_d4 = s_d5 = s_d8 = s_d10 = s_dn = 0;      // hrv-resolution-spec-v1 s4
+  s_dm = DM_SENTINEL;                                // hrv-resolution-spec-v1 s4
+  s_dm_prev = 0;                                     // hrv-resolution-spec-v1 s4
   memset(s_epoch_ahr, 0, sizeof(s_epoch_ahr));       // classifier-spec-v5 s2
   s_ahr_min = s_ahr_max = 0;                         // classifier-spec-v5 s7
   s_ahr_whole = 0;                                   // ab-readout-spec-v1 s2
@@ -1696,6 +1743,61 @@ static void prv_draw_diag3(Layer *layer, GContext *ctx) {
   graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
 }
+// hrv-resolution-spec-v1 s5: DIAG 3 is FULL at nine lines and nine is the
+// ceiling -- the nine-line fit was verified on the watch, ten and eleven were
+// NOT and must not be assumed. These seven values therefore live on a NEW
+// screen. FOUR lines, well inside the ceiling.
+static void prv_draw_diag4(Layer *layer, GContext *ctx) {
+  GRect b = layer_get_bounds(layer);
+  graphics_context_set_text_color(ctx, GColorBlack);
+  char line[64];
+  int y = 2;
+  GFont f = fonts_get_system_font(FONT_KEY_GOTHIC_14);
+  snprintf(line, sizeof(line), "Diag 4");
+  graphics_draw_text(ctx, line, fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
+    GRect(4, y, b.size.w - 8, 28), GTextOverflowModeTrailingEllipsis,
+    GTextAlignmentLeft, NULL); y += 28;
+  // s5: guard keys on s_session_start, NOT s_recording, so the values still
+  // read after stop -- identical to the cadence and RSA lines on DIAG 3.
+  // Zero prints -- and NEVER 0 per measurement-spec-v1 s3.6. A DEFINED D8 of 0
+  // is a REAL ZERO and is a finding. NO fraction and no percentage is
+  // rendered: all seven values are on this screen, so deriving every ratio at
+  // scoring time is not a Rule 6 violation (s5).
+  if (s_session_start == 0) {
+    snprintf(line, sizeof(line), "D2 --  D4 --");
+  } else {
+    snprintf(line, sizeof(line), "D2 %lu  D4 %lu",
+      (unsigned long)s_d2, (unsigned long)s_d4);
+  }
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  if (s_session_start == 0) {
+    snprintf(line, sizeof(line), "D5 --  D8 --");
+  } else {
+    snprintf(line, sizeof(line), "D5 %lu  D8 %lu",
+      (unsigned long)s_d5, (unsigned long)s_d8);
+  }
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  if (s_session_start == 0) {
+    snprintf(line, sizeof(line), "D10 --  Dn --");
+  } else {
+    snprintf(line, sizeof(line), "D10 %lu  Dn %lu",
+      (unsigned long)s_d10, (unsigned long)s_dn);
+  }
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  // s5: Dm renders -- when it was never lowered from its sentinel, which on a
+  // real session means no two consecutive accepted intervals ever differed --
+  // itself a finding, and NOT the same thing as an undefined session.
+  if (s_session_start == 0 || s_dm == DM_SENTINEL) {
+    snprintf(line, sizeof(line), "Dm --");
+  } else {
+    snprintf(line, sizeof(line), "Dm %lu", (unsigned long)s_dm);
+  }
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+}
 static void prv_compute_runs(RunStats *st) {
   memset(st, 0, sizeof(*st));
   st->first_off = 0;
@@ -1912,6 +2014,7 @@ static void prv_canvas_update(Layer *layer, GContext *ctx) {
     case MODE_DIAG:      prv_draw_diag(layer, ctx);      break;
     case MODE_DIAG2:     prv_draw_diag2(layer, ctx);     break;
     case MODE_DIAG3:     prv_draw_diag3(layer, ctx);     break;
+    case MODE_DIAG4:     prv_draw_diag4(layer, ctx);     break;
     case MODE_RUNS:      prv_draw_runs(layer, ctx);      break;
     case MODE_HISTORY:   prv_draw_history(layer, ctx);   break;
     case MODE_IDLE:
@@ -2020,6 +2123,17 @@ static void prv_diag3_to_diag2(ClickRecognizerRef r, void *ctx) {
   window_set_click_config_provider(s_window, prv_click_config);
   layer_mark_dirty(s_canvas);
 }
+// hrv-resolution-spec-v1 s5
+static void prv_diag3_to_diag4(ClickRecognizerRef r, void *ctx) {
+  s_mode = MODE_DIAG4;
+  window_set_click_config_provider(s_window, prv_click_config);
+  layer_mark_dirty(s_canvas);
+}
+static void prv_diag4_to_diag3(ClickRecognizerRef r, void *ctx) {
+  s_mode = MODE_DIAG3;
+  window_set_click_config_provider(s_window, prv_click_config);
+  layer_mark_dirty(s_canvas);
+}
 static void prv_diag2_to_diag(ClickRecognizerRef r, void *ctx) {
   s_mode = MODE_DIAG;
   window_set_click_config_provider(s_window, prv_click_config);
@@ -2070,7 +2184,12 @@ static void prv_click_config(void *ctx) {
       break;
     case MODE_DIAG3:
       window_single_click_subscribe(BUTTON_ID_UP, prv_diag3_to_diag2);
+      window_single_click_subscribe(BUTTON_ID_DOWN, prv_diag3_to_diag4);
       window_single_click_subscribe(BUTTON_ID_BACK, prv_diag3_to_diag2);
+      break;
+    case MODE_DIAG4:
+      window_single_click_subscribe(BUTTON_ID_UP, prv_diag4_to_diag3);
+      window_single_click_subscribe(BUTTON_ID_BACK, prv_diag4_to_diag3);
       break;
     case MODE_RUNS:
       window_single_click_subscribe(BUTTON_ID_UP, prv_runs_to_idle);
