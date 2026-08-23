@@ -252,7 +252,28 @@ static uint16_t s_mins[4] = {0, 0, 0, 0};
 static uint8_t s_awake_streak = 0;
 static SleepStage s_last_stage = StageLight;
 static AppTimer *s_ui_timer = NULL;
-typedef enum { MODE_IDLE, MODE_RECORDING, MODE_RESULTS, MODE_HYPNO, MODE_HISTORY, MODE_DIAG, MODE_DIAG2, MODE_DIAG3, MODE_DIAG4, MODE_RUNS } ScreenMode;
+typedef enum { MODE_IDLE, MODE_RECORDING, MODE_RESULTS, MODE_HYPNO, MODE_HISTORY, MODE_DIAG, MODE_DIAG2, MODE_DIAG3, MODE_DIAG4, MODE_DIAG5, MODE_RUNS } ScreenMode;
+
+// onwatch-timing-readout-spec-v1 s4: the timing instrument. NOT session-scoped
+// and NOT gated on s_recording -- it is an on-demand synthetic benchmark and
+// has nothing to do with a night. s5: the undefined guard keys on s_tr, the
+// run's OWN completion, and NOT on s_session_start, so the readout works on a
+// watch that has never recorded. Tr 0 means no run has completed and NO
+// derived quantity may be computed from it (s4).
+#define TIME_N     HRV_BUF_MAX   // s8: READ from the existing constant, not chosen
+#define TIME_REPS  64            // s4: divided back out at scoring time
+static uint32_t s_tf = 0;        // ms for TIME_REPS reps, full inner loop
+static uint32_t s_tt = 0;        // ms for TIME_REPS reps, trig-only path
+static uint32_t s_tn = 0;        // points actually used
+static uint32_t s_tr = 0;        // reps actually completed
+// s4.2: the optimizer will delete a loop whose result is never used. The SDK
+// builds at -Os. Tt is the most exposed value in the spec because the
+// trig-only path computes values it then discards, which is the exact
+// signature of dead code. The terminal accumulator of EACH timed workload is
+// written here AFTER the clock is read, so the sink does not enter the
+// measurement. A Tt that does not scale with TIME_REPS HAS BEEN OPTIMISED
+// AWAY and the reading is VOID.
+static volatile uint32_t s_time_sink = 0;
 static ScreenMode s_mode = MODE_IDLE;
 static uint8_t s_hist_idx = 0;      // 0 = newest
 static uint8_t s_hist_count = 0;    // populated nights at entry
@@ -1747,6 +1768,75 @@ static void prv_draw_diag3(Layer *layer, GContext *ctx) {
 // ceiling -- the nine-line fit was verified on the watch, ten and eleven were
 // NOT and must not be assumed. These seven values therefore live on a NEW
 // screen. FOUR lines, well inside the ceiling.
+// onwatch-timing-readout-spec-v1 s3/s4/s4.1/s4.2. Synthetic, deterministic,
+// reproducible on demand. s3: the generator MUST cost one or two cycles and
+// MUST use no division and no modulo -- an expensive generator is timed
+// alongside the periodogram arithmetic and would INFLATE Tf, producing a FALSE
+// STOP. Multiply-and-mask only.
+static inline uint16_t prv_time_synth(uint32_t i) {
+  return (uint16_t)(800u + ((i * 13u) & 0x7Fu));
+}
+// s4.1: time_ms returns the MILLISECONDS PORTION, which wraps every second.
+// Elapsed MUST come from BOTH parts. The int32_t casts are part of the
+// requirement: two uint16_t operands promote to int and are already signed,
+// but the natural implementation stores ms beside a time_t and reaches for
+// uint32_t, where the promotion does not happen and 100 - 900 evaluates to
+// 4294966396. The casts foreclose that whatever the storage type.
+static uint32_t prv_elapsed_ms(time_t s0, uint16_t m0, time_t s1, uint16_t m1) {
+  int32_t e = ((int32_t)s1 - (int32_t)s0) * 1000
+            + ((int32_t)m1 - (int32_t)m0);
+  return (e < 0) ? 0u : (uint32_t)e;
+}
+static void prv_run_timing(void) {
+  time_t s0, s1; uint16_t m0, m1;
+  uint32_t acc;
+  // ---- Tf: full inner loop, one frequency, TIME_N points ----
+  // s4/rrv s4: phase increment precomputed ONCE per frequency in 64-bit with
+  // 8 fractional bits; per point the accumulate is 32-bit and is allowed to
+  // wrap, because the scaled full turn is 65536*256 = 2^24 and 2^32 is an
+  // EXACT multiple of 2^24, so uint32_t wraparound IS exact modular reduction.
+  const uint32_t f_mhz = 250;  // mid-band probe frequency, millihertz
+  const uint32_t inc = (uint32_t)(((uint64_t)f_mhz * 65536ULL * 256ULL) / 1000000ULL);
+  time_ms(&s0, &m0);
+  int64_t sc = 0, ss = 0, scc = 0, sss = 0;
+  for (uint32_t rep = 0; rep < TIME_REPS; rep++) {
+    uint32_t phase = 0;
+    for (uint32_t i = 0; i < TIME_N; i++) {
+      uint16_t p = prv_time_synth(i);
+      int32_t y = (int32_t)p - 850;              // mean-removed, SIGNED
+      int32_t a = (int32_t)((phase >> 8) & 0xFFFF);
+      int32_t cs = cos_lookup(a);
+      int32_t sn = sin_lookup(a);
+      sc  += (int64_t)y * cs;
+      ss  += (int64_t)y * sn;
+      scc += (int64_t)cs * cs;
+      sss += (int64_t)sn * sn;
+      phase += inc * (uint32_t)p;                // wraps exactly
+    }
+  }
+  time_ms(&s1, &m1);
+  s_tf = prv_elapsed_ms(s0, m0, s1, m1);
+  // s4.2: sink written AFTER the clock read so it does not enter the measurement
+  acc = (uint32_t)(sc ^ ss ^ scc ^ sss);
+  s_time_sink = acc;
+  // ---- Tt: trig-only path, same points and reps, no sums ----
+  time_ms(&s0, &m0);
+  int64_t tacc = 0;
+  for (uint32_t rep = 0; rep < TIME_REPS; rep++) {
+    uint32_t phase = 0;
+    for (uint32_t i = 0; i < TIME_N; i++) {
+      uint16_t p = prv_time_synth(i);
+      int32_t a = (int32_t)((phase >> 8) & 0xFFFF);
+      tacc += cos_lookup(a) + sin_lookup(a);
+      phase += inc * (uint32_t)p;
+    }
+  }
+  time_ms(&s1, &m1);
+  s_tt = prv_elapsed_ms(s0, m0, s1, m1);
+  s_time_sink = (uint32_t)tacc;
+  s_tn = TIME_N;
+  s_tr = TIME_REPS;
+}
 static void prv_draw_diag4(Layer *layer, GContext *ctx) {
   GRect b = layer_get_bounds(layer);
   graphics_context_set_text_color(ctx, GColorBlack);
@@ -1794,6 +1884,41 @@ static void prv_draw_diag4(Layer *layer, GContext *ctx) {
     snprintf(line, sizeof(line), "Dm --");
   } else {
     snprintf(line, sizeof(line), "Dm %lu", (unsigned long)s_dm);
+  }
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+}
+// onwatch-timing-readout-spec-v1 s5. Two value lines. The guard keys on s_tr,
+// NOT s_session_start -- see the statics block. s5: `--` means NOT YET RUN and
+// `REC` means REFUSED WHILE RECORDING. Two different states that must not
+// share a render (RULE 9).
+static void prv_draw_diag5(Layer *layer, GContext *ctx) {
+  GRect b = layer_get_bounds(layer);
+  graphics_context_set_text_color(ctx, GColorBlack);
+  char line[64];
+  int y = 2;
+  GFont f = fonts_get_system_font(FONT_KEY_GOTHIC_14);
+  snprintf(line, sizeof(line), "Diag 5");
+  graphics_draw_text(ctx, line, fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
+    GRect(4, y, b.size.w - 8, 28), GTextOverflowModeTrailingEllipsis,
+    GTextAlignmentLeft, NULL); y += 28;
+  if (s_recording) {
+    snprintf(line, sizeof(line), "Tf REC  Tt REC");
+  } else if (s_tr == 0) {
+    snprintf(line, sizeof(line), "Tf --  Tt --");
+  } else {
+    snprintf(line, sizeof(line), "Tf %lu  Tt %lu",
+      (unsigned long)s_tf, (unsigned long)s_tt);
+  }
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  if (s_recording) {
+    snprintf(line, sizeof(line), "Tn REC  Tr REC");
+  } else if (s_tr == 0) {
+    snprintf(line, sizeof(line), "Tn --  Tr --");
+  } else {
+    snprintf(line, sizeof(line), "Tn %lu  Tr %lu",
+      (unsigned long)s_tn, (unsigned long)s_tr);
   }
   graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
@@ -2015,6 +2140,7 @@ static void prv_canvas_update(Layer *layer, GContext *ctx) {
     case MODE_DIAG2:     prv_draw_diag2(layer, ctx);     break;
     case MODE_DIAG3:     prv_draw_diag3(layer, ctx);     break;
     case MODE_DIAG4:     prv_draw_diag4(layer, ctx);     break;
+    case MODE_DIAG5:     prv_draw_diag5(layer, ctx);     break;
     case MODE_RUNS:      prv_draw_runs(layer, ctx);      break;
     case MODE_HISTORY:   prv_draw_history(layer, ctx);   break;
     case MODE_IDLE:
@@ -2134,6 +2260,26 @@ static void prv_diag4_to_diag3(ClickRecognizerRef r, void *ctx) {
   window_set_click_config_provider(s_window, prv_click_config);
   layer_mark_dirty(s_canvas);
 }
+// onwatch-timing-readout-spec-v1 s5
+static void prv_diag4_to_diag5(ClickRecognizerRef r, void *ctx) {
+  s_mode = MODE_DIAG5;
+  window_set_click_config_provider(s_window, prv_click_config);
+  layer_mark_dirty(s_canvas);
+}
+static void prv_diag5_to_diag4(ClickRecognizerRef r, void *ctx) {
+  s_mode = MODE_DIAG4;
+  window_set_click_config_provider(s_window, prv_click_config);
+  layer_mark_dirty(s_canvas);
+}
+// s5: THE ONE HARD GUARD. A multi-hundred-millisecond CPU burst during a night
+// perturbs the very thing every other instrument is measuring, and the capture
+// sequence walks the DIAG screens AT STOP while the session statics are live.
+// The natural place to press this is precisely the wrong place.
+static void prv_diag5_select(ClickRecognizerRef r, void *ctx) {
+  if (s_recording) { layer_mark_dirty(s_canvas); return; }
+  prv_run_timing();
+  layer_mark_dirty(s_canvas);
+}
 static void prv_diag2_to_diag(ClickRecognizerRef r, void *ctx) {
   s_mode = MODE_DIAG;
   window_set_click_config_provider(s_window, prv_click_config);
@@ -2189,7 +2335,13 @@ static void prv_click_config(void *ctx) {
       break;
     case MODE_DIAG4:
       window_single_click_subscribe(BUTTON_ID_UP, prv_diag4_to_diag3);
+      window_single_click_subscribe(BUTTON_ID_DOWN, prv_diag4_to_diag5);
       window_single_click_subscribe(BUTTON_ID_BACK, prv_diag4_to_diag3);
+      break;
+    case MODE_DIAG5:
+      window_single_click_subscribe(BUTTON_ID_UP, prv_diag5_to_diag4);
+      window_single_click_subscribe(BUTTON_ID_SELECT, prv_diag5_select);
+      window_single_click_subscribe(BUTTON_ID_BACK, prv_diag5_to_diag4);
       break;
     case MODE_RUNS:
       window_single_click_subscribe(BUTTON_ID_UP, prv_runs_to_idle);
