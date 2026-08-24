@@ -35,11 +35,20 @@ static uint32_t s_gn = 0;           // number of clean runs
 // instrument's OWN denominator, incremented at the same site so all six share
 // one increment path and one scope, which is what makes the s4 nesting
 // identities checkable from the rendered values alone (s4).
+// hrv-resolution-divisor-extension-2026-08-23 s3: s_d20 and s_d3 ADDED. Adding
+// is not moving -- the five original divisors are untouched and compute exactly
+// what they computed on N29. s_d20 is the one that answers the open question:
+// a 10 ms coarse component and a 20 ms one predict the SAME D5 and the SAME
+// D10, so the existing set cannot separate them at all, and that boundary is
+// exactly where the GO/STOP line sits. s_d3 closes part of the enumeration gap
+// and is secondary -- no prediction is made about it (s6).
 static uint32_t s_d2 = 0;
+static uint32_t s_d3 = 0;
 static uint32_t s_d4 = 0;
 static uint32_t s_d5 = 0;
 static uint32_t s_d8 = 0;
 static uint32_t s_d10 = 0;
+static uint32_t s_d20 = 0;
 static uint32_t s_dn = 0;
 // s4: SMALLEST NON-ZERO absolute difference between CONSECUTIVE ACCEPTED
 // intervals. Bounds the quantisation step WITHOUT enumerating divisors, so a
@@ -476,6 +485,9 @@ static void prv_health_handler(HealthEventType event, void *context) {
           // be reintroduced in a new instrument.
           s_dn++;
           if (ppi % 2 == 0) s_d2++;
+          // divisor-extension s3: same site, same scope, same increment path
+          if (ppi % 3 == 0) s_d3++;
+          if (ppi % 20 == 0) s_d20++;
           if (ppi % 4 == 0) s_d4++;
           if (ppi % 5 == 0) s_d5++;
           if (ppi % 8 == 0) s_d8++;
@@ -527,6 +539,7 @@ static void prv_start_recording(void) {
   s_g_run = 0;                                       // rsa-feasibility-spec-v1 s4
   s_g_prev_t = 0;                                    // rsa-feasibility-spec-v1 s4
   s_d2 = s_d4 = s_d5 = s_d8 = s_d10 = s_dn = 0;      // hrv-resolution-spec-v1 s4
+  s_d3 = s_d20 = 0;                                  // divisor-extension s3
   s_dm = DM_SENTINEL;                                // hrv-resolution-spec-v1 s4
   s_dm_prev = 0;                                     // hrv-resolution-spec-v1 s4
   memset(s_epoch_ahr, 0, sizeof(s_epoch_ahr));       // classifier-spec-v5 s2
@@ -1880,6 +1893,17 @@ static void prv_draw_diag4(Layer *layer, GContext *ctx) {
   // s5: Dm renders -- when it was never lowered from its sentinel, which on a
   // real session means no two consecutive accepted intervals ever differed --
   // itself a finding, and NOT the same thing as an undefined session.
+  // divisor-extension s5: DIAG 4 goes from FOUR lines to FIVE. This line sits
+  // ABOVE Dm deliberately so Dm remains the LAST line. A DEFINED D20 of 0 is a
+  // REAL ZERO and is a finding -- no accepted interval a multiple of 20.
+  if (s_session_start == 0) {
+    snprintf(line, sizeof(line), "D3 --  D20 --");
+  } else {
+    snprintf(line, sizeof(line), "D3 %lu  D20 %lu",
+      (unsigned long)s_d3, (unsigned long)s_d20);
+  }
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
   if (s_session_start == 0 || s_dm == DM_SENTINEL) {
     snprintf(line, sizeof(line), "Dm --");
   } else {
