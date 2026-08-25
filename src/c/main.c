@@ -936,8 +936,15 @@ static void prv_awake_redecide(void) {
     // Light/REM decision, which skips StageAwake (bae23c3 s2, unchanged).
     if (!(c1 || c2) && rec.stage != (uint8_t)StageAwake) continue;
     if ((uint8_t)ns_stage == rec.stage) continue;
-    if (s_mins[rec.stage] > 0) s_mins[rec.stage]--;
-    s_mins[ns_stage]++;
+    // stage-counter-atomicity-fix-2026-08-24 s3: the move happens in full or
+    // not at all. The decrement was guarded and the increment was not, so a
+    // guard hit manufactured a minute and sum(s_mins) exceeded the stored
+    // epoch count. s_mins is uint16_t -- dropping the guard instead would
+    // wrap to 65535, which is a worse failure than an inflated one.
+    if (s_mins[rec.stage] > 0) {
+      s_mins[rec.stage]--;
+      s_mins[ns_stage]++;
+    }
     rec.stage = (uint8_t)ns_stage;
     storage_epoch_update(i, &rec);
   }
@@ -1061,8 +1068,15 @@ static void prv_base_redecide(uint32_t anchor, uint16_t anchor_hr) {
       else                 s_veto_t3++;
     }
     if ((uint8_t)ns_stage == rec.stage) continue;
-    if (s_mins[rec.stage] > 0) s_mins[rec.stage]--;
-    s_mins[ns_stage]++;
+    // stage-counter-atomicity-fix-2026-08-24 s3: the move happens in full or
+    // not at all. The decrement was guarded and the increment was not, so a
+    // guard hit manufactured a minute and sum(s_mins) exceeded the stored
+    // epoch count. s_mins is uint16_t -- dropping the guard instead would
+    // wrap to 65535, which is a worse failure than an inflated one.
+    if (s_mins[rec.stage] > 0) {
+      s_mins[rec.stage]--;
+      s_mins[ns_stage]++;
+    }
     rec.stage = (uint8_t)ns_stage;
     storage_epoch_update(i, &rec);
   }
