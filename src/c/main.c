@@ -63,6 +63,17 @@ static uint32_t s_dm = DM_SENTINEL;
 // using that would compute differences ACROSS rejected beats and would measure
 // a different quantity than the spec defines.
 static uint16_t s_dm_prev = 0;
+// coarse-adjacency-counter-spec-v1 s4: CONSECUTIVE ACCEPTED PAIRS in which BOTH
+// intervals are divisible by 10. Session-scoped, same site and same increment
+// path as the divisors above. It reads s_dm_prev BEFORE that is overwritten, so
+// the pair is (previous accepted, current accepted) -- the same accepted-only
+// adjacency s_dm uses, and NOT the ppi > 0 population Hd counts over.
+// THE DENOMINATOR IS DERIVED AS Dn - 1 AND IS DELIBERATELY NOT COUNTED (s5):
+// the pair test runs for every accepted interval after the session's first, so
+// a second counter would agree with Dn - 1 on every reachable state at a fixed
+// pin -- a construction, never a corroboration (RULE 20).
+// P-DCIDENT bounds it: max(0, 2*D10 - Dn - 1) <= Dc <= D10 - 1 (s5.2).
+static uint32_t s_dc = 0;
 // s4: s_g_prev_rej records the PREVIOUS s_night_buf call's return value.
 // hrv_buf_add ALREADY returns false on rejection (hrv_math.c 22,36) and the
 // caller discarded it. NO GATE CHANGES AND NO NEW CONSTANT IS INTRODUCED.
@@ -498,6 +509,11 @@ static void prv_health_handler(HealthEventType event, void *context) {
                                            : (uint32_t)(s_dm_prev - ppi);
             if (d > 0 && d < s_dm) s_dm = d;
           }
+          // coarse-adjacency-counter-spec-v1 s4: consecutive ACCEPTED pairs in
+          // which BOTH intervals are divisible by 10. MUST stay inside if (acc)
+          // and under no other conditional -- the Dn - 1 denominator identity
+          // depends on it (s5.1) and NOTHING AT RUNTIME WOULD CATCH A MOVE.
+          if (s_dm_prev > 0 && (ppi % 10 == 0) && (s_dm_prev % 10 == 0)) s_dc++;
           s_dm_prev = ppi;
         }
         s_g_prev_rej = !acc;
@@ -542,6 +558,7 @@ static void prv_start_recording(void) {
   s_d3 = s_d20 = 0;                                  // divisor-extension s3
   s_dm = DM_SENTINEL;                                // hrv-resolution-spec-v1 s4
   s_dm_prev = 0;                                     // hrv-resolution-spec-v1 s4
+  s_dc = 0;                                          // coarse-adjacency-counter-spec-v1 s4
   memset(s_epoch_ahr, 0, sizeof(s_epoch_ahr));       // classifier-spec-v5 s2
   s_ahr_min = s_ahr_max = 0;                         // classifier-spec-v5 s7
   s_ahr_whole = 0;                                   // ab-readout-spec-v1 s2
@@ -1458,8 +1475,10 @@ static void prv_draw_history(Layer *layer, GContext *ctx) {
 }
 
 // measurement-spec-v1 s3.6: DIAG is a diagnostic screen. RESULTS is
-// unchanged. A v1 record has no measured tail, so it prints -- rather
-// than 0 - zero is a meaningful measured value here.
+// unchanged. measurement-spec-v1 s3.5: a v1 record has no measured tail,
+// so it prints -- rather than 0 - zero is a meaningful measured value
+// here. Split from a single s3.6 citation that had annexed the second
+// clause -- display-guard-citation-correction-2026-08-26 s5, s8 item 4.
 static void prv_draw_diag(Layer *layer, GContext *ctx) {
   GRect b = layer_get_bounds(layer);
   graphics_context_set_text_color(ctx, GColorBlack);
@@ -1662,7 +1681,7 @@ typedef struct {
   // awc-spec-v1 identity-correction 2026-08-18 s2: AwO, the count of epochs
   // whose PRE-smoother stage is Awake at or after s_onset_epoch_idx. The
   // right-hand side of the corrected identity. UNDEFINED when onset is
-  // undefined -- prints -- and NEVER 0 (measurement-spec-v1 s3.6).
+  // undefined -- prints -- and NEVER 0 (measurement-spec-v1 s3.5).
   uint16_t awake_post_onset;
   bool has_awo;
   // awake-runs-readout-spec-v1 s2: POST-smoother Awake episode structure.
@@ -1715,7 +1734,7 @@ static void prv_draw_diag3(Layer *layer, GContext *ctx) {
   graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
   // stillness-run-readout-spec-v1 s4: the run-length distribution in minutes.
-  // UNDEFINED prints -- and NEVER 0 (measurement-spec-v1 s3.6). Sr5 0 with a
+  // UNDEFINED prints -- and NEVER 0 (measurement-spec-v1 s3.5). Sr5 0 with a
   // defined SrN is a REAL ZERO -- runs existed and none reached the threshold,
   // which is a finding and not a gap.
   if (s_sr_n == 0) {
@@ -1876,10 +1895,13 @@ static void prv_draw_diag4(Layer *layer, GContext *ctx) {
     GTextAlignmentLeft, NULL); y += 28;
   // s5: guard keys on s_session_start, NOT s_recording, so the values still
   // read after stop -- identical to the cadence and RSA lines on DIAG 3.
-  // Zero prints -- and NEVER 0 per measurement-spec-v1 s3.6. A DEFINED D8 of 0
+  // Zero prints -- and NEVER 0 per measurement-spec-v1 s3.5 -- corrected from
+  // s3.6 by display-guard-citation-correction-2026-08-26 s8. A DEFINED D8 of 0
   // is a REAL ZERO and is a finding. NO fraction and no percentage is
-  // rendered: all seven values are on this screen, so deriving every ratio at
-  // scoring time is not a Rule 6 violation (s5).
+  // rendered: all ten values are on this screen, so deriving every ratio at
+  // scoring time is not a Rule 6 violation (s5). The count was seven when this
+  // comment was written, went to nine at the divisor extension without being
+  // updated, and is ten from coarse-adjacency-counter-spec-v1 s6.1.
   if (s_session_start == 0) {
     snprintf(line, sizeof(line), "D2 --  D4 --");
   } else {
@@ -1915,6 +1937,18 @@ static void prv_draw_diag4(Layer *layer, GContext *ctx) {
   } else {
     snprintf(line, sizeof(line), "D3 %lu  D20 %lu",
       (unsigned long)s_d3, (unsigned long)s_d20);
+  }
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  // coarse-adjacency-counter-spec-v1 s6: DIAG 4 goes from FIVE lines to SIX.
+  // Dc sits ABOVE Dm deliberately so Dm remains the LAST line, which is where
+  // the capture sequence's reader has learned to find it. A DEFINED Dc of 0 is
+  // a REAL ZERO and is a finding -- no consecutive accepted pair was ever
+  // both-coarse.
+  if (s_session_start == 0) {
+    snprintf(line, sizeof(line), "Dc --");
+  } else {
+    snprintf(line, sizeof(line), "Dc %lu", (unsigned long)s_dc);
   }
   graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
