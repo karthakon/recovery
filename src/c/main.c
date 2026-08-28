@@ -59,7 +59,8 @@ static uint32_t s_dn = 0;
 #define DM_SENTINEL 65535u
 static uint32_t s_dm = DM_SENTINEL;
 // s4: the previous ACCEPTED interval's VALUE. Deliberately NOT s_hd_prev,
-// which is assigned on every ppi > 0 event whether accepted or rejected --
+// which is assigned on every ppi > 0 event WHILE RECORDING, whether that
+// interval was accepted or rejected --
 // using that would compute differences ACROSS rejected beats and would measure
 // a different quantity than the spec defines.
 static uint16_t s_dm_prev = 0;
@@ -75,7 +76,7 @@ static uint16_t s_dm_prev = 0;
 // P-DCIDENT bounds it: max(0, 2*D10 - Dn - 1) <= Dc <= D10 - 1 (s5.2).
 static uint32_t s_dc = 0;
 // s4: s_g_prev_rej records the PREVIOUS s_night_buf call's return value.
-// hrv_buf_add ALREADY returns false on rejection (hrv_math.c 22,36) and the
+// hrv_buf_add ALREADY returns false on rejection (hrv_math.c 23,36) and the
 // caller discarded it. NO GATE CHANGES AND NO NEW CONSTANT IS INTRODUCED.
 static bool s_g_prev_rej = false;
 static uint32_t s_g_run = 0;        // current clean run length, in beats
@@ -88,7 +89,7 @@ static uint32_t s_mv_moved = 0;
 static uint16_t s_mv_min_samples = 0;
 static uint16_t s_mv_min_moved = 0;
 // Count of minutes closed with NO accel sample (mv_known false). RAM-only,
-// session-scoped, rendered on DIAG. Diagnostic-queue item 17.
+// session-scoped, rendered on DIAG 2. Diagnostic-queue item 17.
 static uint16_t s_unknown_min = 0;
 // classifier-spec-v4 s5: percentile summary of F(m) over the T1 population --
 // the SAME population A_D is the median of. RAM-only, session-scoped,
@@ -102,7 +103,7 @@ static uint16_t s_fd_n = 0;
 // decision. did_vibrate was ALWAYS available - the peek path never read it.
 static uint32_t s_vibe_samples = 0;
 // movement-spec-v1 s6: minutes with Quiet Time active. The API is READ-ONLY
-// (pebble.h 9003) - an app CANNOT enable it or prevent its being disabled.
+// (pebble.h 9005) - an app CANNOT enable it or prevent its being disabled.
 static uint16_t s_qt_min = 0;
 // awake-clause-counters-spec-v1 s2: which of prv_awake_redecide's two
 // independent clauses fired, partitioned three ways over two spans from
@@ -256,7 +257,8 @@ static uint16_t s_epoch_ahr[EPOCH_VAR_MAX];
 static uint16_t s_ahr_min = 0;
 static uint16_t s_ahr_max = 0;
 // awake-reference-ab-readout-spec-v1 s2: the WHOLE-NIGHT reference, retained
-// as a COUNTERFACTUAL ONLY. NOTHING READS IT AND IT DECIDES NOTHING -- c2
+// as a COUNTERFACTUAL ONLY. NO DECISION READS IT AND IT DECIDES NOTHING --
+// s_ab_w counts against it and nothing else does -- c2
 // continues to read s_epoch_ahr and only that (s5). It exists to be counted
 // against, so the reference change is attributable WITHIN one night rather
 // than across a comparability boundary it cannot cross. 0 means UNDEFINED.
@@ -621,7 +623,9 @@ static void prv_measure(uint32_t base_final) {
   s_v_count = 0; s_v_over_gate = 0;
 
   // measurement-spec-v1 feature correction s2: the gate counts the minutes the
-  // classifier decided REM, so it tests F(m) > 2*A over EPOCH-INDEXED s_epoch_f
+  // classifier decided REM, so it tests F(m) > A over EPOCH-INDEXED s_epoch_f
+  // -- classifier-spec-v4 s2 moved T1's edge from 2*A_D to A_D and the gate
+  // follows it; the earlier 2*A wording described the pre-v4 threshold
   // and applies the same skips prv_base_redecide applies. This MUST run before
   // the compaction below, which destroys epoch indexing.
   if (base_final > 0) {
@@ -722,7 +726,9 @@ static uint16_t prv_window_median_hr(uint16_t m, uint16_t n) {
 // classifier-spec-v3 s3.5/s3.6/s4.2: the Awake re-decision pass. Runs BEFORE
 // prv_compute_anchor (s5 step 3 before step 4) -- that single ordering is the
 // whole mechanism, so anchors are computed over a CORRECTED label set.
-// This is the ONLY pass that writes StageAwake.
+// This is the ONLY STOP-TIME RE-DECISION PASS that writes StageAwake. The
+// LIVE classifier writes it in prv_close_minute and smoother_run writes it
+// from s_path; prv_base_redecide skips Awake and prv_measure is read-only.
 static void prv_awake_redecide(void) {
   uint16_t n = storage_epoch_count();
   if (n > s_epoch_var_count) n = s_epoch_var_count;
@@ -905,7 +911,9 @@ static void prv_awake_redecide(void) {
     // "of 5" and a continuity document carried it as 5-of-5; see the define.
     bool c1 = (moved >= AW_MOVED_MIN);
     // s4.2 clause 2: A defined, HF defined, HF(m) * 100 > A * 103. The 103 is
-    // carried from sleep_stage.c's 97; its REFERENCE is not carried. When A is
+    // carried from the 97 of the PRE-v3 live HR clause, which
+    // classifier-spec-v3 s4.1 REMOVED from sleep_stage.c -- no 97 remains
+    // there. Its REFERENCE is not carried. When A is
     // undefined no minute is scored Awake by the HR term -- a missing baseline
     // must never make Awake EASIER to declare.
     // classifier-spec-v5 s2: the reference is now PER-MINUTE. The 103 is NOT
@@ -1647,10 +1655,13 @@ static void prv_draw_diag2(Layer *layer, GContext *ctx) {
 }
 
 // epoch-readout-spec-v1 s3: run-length statistics over the PRE-SMOOTHER
-// stage held in EpochRecord.reserved (smoother.c line 215 writes it there
+// stage held in EpochRecord.reserved (smoother.c line 265 writes it there
 // before overwriting rec.stage). READ ONLY - storage_epoch_read only, never
 // storage_epoch_update. No EpochRecord change, no new static array.
-// s2 registered identity: rem_total MUST equal the night's v_over_gate_count.
+// s2 registers rem_total <= v_over_gate_count. THE EQUALITY IS NOT REGISTERED
+// and does not hold: measurement-spec-v1-feature-correction s2 declined to
+// register it, and prv_measure re-reads rec.stage AFTER the re-decision
+// rewrote it, so the two Awake skips filter different sets.
 // awake-runs-readout-spec-v1 s3: a run longer than this is tallied into one
 // REPORTED count. It comes from the USER'S SELF-REPORT, not from a
 // measurement and not from the literature. NOTHING BRANCHES ON IT -- moving
@@ -1698,7 +1709,7 @@ typedef struct {
 } RunStats;
 
 // Onset by the SAME ONSET_RUN 5 consecutive non-Awake rule find_onset uses
-// (smoother.c lines 93-106), applied over reserved. -1 if none.
+// (smoother.c lines 110-123), applied over reserved. -1 if none.
 #define RUNS_ONSET_RUN 5
 
 // DIAG 3. stillness-run-readout-spec-v1 s5: DIAG 2 and RUNS were both FULL at
@@ -1813,7 +1824,8 @@ static void prv_draw_diag3(Layer *layer, GContext *ctx) {
 // hrv-resolution-spec-v1 s5: DIAG 3 is FULL at nine lines and nine is the
 // ceiling -- the nine-line fit was verified on the watch, ten and eleven were
 // NOT and must not be assumed. These seven values therefore live on a NEW
-// screen. FOUR lines, well inside the ceiling.
+// screen -- FOUR lines at creation. DIAG 4 now renders TEN values on SIX
+// lines; see the count history on prv_draw_diag4.
 // onwatch-timing-readout-spec-v1 s3/s4/s4.1/s4.2. Synthetic, deterministic,
 // reproducible on demand. s3: the generator MUST cost one or two cycles and
 // MUST use no division and no modulo -- an expensive generator is timed
@@ -2028,7 +2040,7 @@ static void prv_compute_runs(RunStats *st) {
     have_prev = true;
     // awc-spec-v1 identity-correction 2026-08-18 s3: counted over reserved,
     // the PRE-smoother series, restricted to the same span the six counters
-    // use. main.c 538 leaves the Awake set EXACTLY equal to (c1 || c2) and
+    // use. main.c 918 leaves the Awake set EXACTLY equal to (c1 || c2) and
     // prv_base_redecide skips Awake, so this is the same population.
     if (s_onset_epoch_idx >= 0 && t >= (uint16_t)s_onset_epoch_idx &&
         st_pre == (uint8_t)StageAwake) {
@@ -2171,8 +2183,10 @@ static void prv_draw_runs(Layer *layer, GContext *ctx) {
   graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
   // awc-spec-v1 identity-correction 2026-08-18 s4: the right-hand side of the
-  // corrected identity. RUNS reads PERSIST, so unlike DIAG 2 this survives app
-  // exit and the conditioning check can be re-read at IDLE.
+  // corrected identity. The RUN-LENGTH values read PERSIST and survive app
+  // exit, but AwO and the four Awake-run values below it DO NOT: they guard on
+  // has_awo, which keys on the RAM-only s_onset_epoch_idx and reads -- after an
+  // app exit. CAPTURE THEM LIVE, with DIAG-2 discipline.
   if (st.has_awo) {
     snprintf(line, sizeof(line), "AwO %u", (unsigned)st.awake_post_onset);
   } else {
@@ -2456,8 +2470,9 @@ static void prv_init(void) {
   s_base_next_mark = 0;
   health_service_events_subscribe(prv_health_handler, NULL);
   // movement-spec-v1 s3: TWO calls - subscribe carries no rate parameter.
-  // APP-LIFETIME, not recording-scoped, because prv_close_minute runs
-  // unconditionally and the peek path it replaces also ran outside recording.
+  // APP-LIFETIME, not recording-scoped, because prv_tick_handler CALLS
+  // prv_close_minute unconditionally (its body returns at once when not
+  // recording) and the peek path it replaces also ran outside recording.
   accel_service_set_sampling_rate(ACCEL_SAMPLING_10HZ);
   accel_data_service_subscribe(25, prv_accel_data_handler);
   prv_set_hrv(true);
