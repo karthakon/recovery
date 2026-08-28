@@ -75,6 +75,21 @@ static uint16_t s_dm_prev = 0;
 // pin -- a construction, never a corroboration (RULE 20).
 // P-DCIDENT bounds it: max(0, 2*D10 - Dn - 1) <= Dc <= D10 - 1 (s5.2).
 static uint32_t s_dc = 0;
+// residue-histogram-spec-v1 s4: count of ACCEPTED intervals in each residue
+// class modulo 20. Session-scoped, gated on s_recording, reset in
+// prv_start_recording. P-RIDENT (s7) reconstructs D20, D10, D5, D4 and D2 from
+// these as exact sums; D8 and D3 are NOT reconstructible because 8 and 3 do
+// not divide 20, which is why those divisors are retained.
+static uint32_t s_res[20] = {0};
+// rejected-interval-divisor-counter-spec-v1 s5: intervals REJECTED by each
+// gate on s_night_buf that are divisible by 10. Drr is the RANGE gate, Drj the
+// JUMP gate. The gate identity is not available from hrv_buf_add's bool, so s6
+// snapshots rej_range and rej_jump BEFORE the call and compares after --
+// hrv_buf_add is NOT edited and the band and multiplier are NOT duplicated
+// here (RULE 2). No quality counter: that gate is unreachable, all three call
+// sites passing the literal 1.
+static uint32_t s_drr = 0;
+static uint32_t s_drj = 0;
 // s4: s_g_prev_rej records the PREVIOUS s_night_buf call's return value.
 // hrv_buf_add ALREADY returns false on rejection (hrv_math.c 23,36) and the
 // caller discarded it. NO GATE CHANGES AND NO NEW CONSTANT IS INTRODUCED.
@@ -274,7 +289,7 @@ static uint16_t s_mins[4] = {0, 0, 0, 0};
 static uint8_t s_awake_streak = 0;
 static SleepStage s_last_stage = StageLight;
 static AppTimer *s_ui_timer = NULL;
-typedef enum { MODE_IDLE, MODE_RECORDING, MODE_RESULTS, MODE_HYPNO, MODE_HISTORY, MODE_DIAG, MODE_DIAG2, MODE_DIAG3, MODE_DIAG4, MODE_DIAG5, MODE_RUNS } ScreenMode;
+typedef enum { MODE_IDLE, MODE_RECORDING, MODE_RESULTS, MODE_HYPNO, MODE_HISTORY, MODE_DIAG, MODE_DIAG2, MODE_DIAG3, MODE_DIAG4, MODE_DIAG5, MODE_DIAG6, MODE_DIAG7, MODE_RUNS } ScreenMode;
 
 // onwatch-timing-readout-spec-v1 s4: the timing instrument. NOT session-scoped
 // and NOT gated on s_recording -- it is an on-demand synthetic benchmark and
@@ -470,6 +485,12 @@ static void prv_health_handler(HealthEventType event, void *context) {
       hrv_buf_add(&s_live_buf, ppi, 1, now);
       if (s_recording) {
         hrv_buf_add(&s_minute_buf, ppi, 1, now);
+        // rejected-interval-divisor-counter-spec-v1 s6: snapshot BEFORE the
+        // call so the else branch can tell WHICH gate rejected. Exactly one of
+        // the two can rise per call -- hrv_buf_add returns from whichever gate
+        // fires first.
+        uint32_t rr0 = s_night_buf.rej_range;
+        uint32_t rj0 = s_night_buf.rej_jump;
         // rsa-feasibility-spec-v1 s3: ONLY s_night_buf's verdict is counted.
         bool acc = hrv_buf_add(&s_night_buf, ppi, 1, now);
         if (acc) {
@@ -516,7 +537,24 @@ static void prv_health_handler(HealthEventType event, void *context) {
           // and under no other conditional -- the Dn - 1 denominator identity
           // depends on it (s5.1) and NOTHING AT RUNTIME WOULD CATCH A MOVE.
           if (s_dm_prev > 0 && (ppi % 10 == 0) && (s_dm_prev % 10 == 0)) s_dc++;
+          // residue-histogram-spec-v1 s4: same site, same scope, same increment
+          // path. MUST stay inside if (acc) and under no other conditional --
+          // P-RIDENT's sum relation against Dn depends on it (s7) and NOTHING
+          // AT RUNTIME WOULD CATCH A MOVE.
+          s_res[ppi % 20]++;
           s_dm_prev = ppi;
+        } else {
+          // rejected-interval-divisor-counter-spec-v1 s6: the else branch this
+          // spec ADDS. Whichever snapshot rose identifies the gate. The test is
+          // on ppi -- the rejected interval's value is never stored anywhere.
+          // Neither rising is a QUALITY rejection, which is unreachable; s8
+          // requires that state be diagnosed before anything else on the screen
+          // is read, and it is NOT folded into either counter.
+          if (s_night_buf.rej_range != rr0) {
+            if (ppi % 10 == 0) s_drr++;
+          } else if (s_night_buf.rej_jump != rj0) {
+            if (ppi % 10 == 0) s_drj++;
+          }
         }
         s_g_prev_rej = !acc;
       }
@@ -561,6 +599,8 @@ static void prv_start_recording(void) {
   s_dm = DM_SENTINEL;                                // hrv-resolution-spec-v1 s4
   s_dm_prev = 0;                                     // hrv-resolution-spec-v1 s4
   s_dc = 0;                                          // coarse-adjacency-counter-spec-v1 s4
+  memset(s_res, 0, sizeof(s_res));                   // residue-histogram-spec-v1 s4
+  s_drr = s_drj = 0;                                 // rejected-interval-divisor-spec-v1 s5
   memset(s_epoch_ahr, 0, sizeof(s_epoch_ahr));       // classifier-spec-v5 s2
   s_ahr_min = s_ahr_max = 0;                         // classifier-spec-v5 s7
   s_ahr_whole = 0;                                   // ab-readout-spec-v1 s2
@@ -1913,7 +1953,8 @@ static void prv_draw_diag4(Layer *layer, GContext *ctx) {
   // rendered: all ten values are on this screen, so deriving every ratio at
   // scoring time is not a Rule 6 violation (s5). The count was seven when this
   // comment was written, went to nine at the divisor extension without being
-  // updated, and is ten from coarse-adjacency-counter-spec-v1 s6.1.
+  // updated, went to ten at coarse-adjacency-counter-spec-v1 s6.1, and is
+  // TWELVE from rejected-interval-divisor-counter-spec-v1 s7.
   if (s_session_start == 0) {
     snprintf(line, sizeof(line), "D2 --  D4 --");
   } else {
@@ -1964,6 +2005,19 @@ static void prv_draw_diag4(Layer *layer, GContext *ctx) {
   }
   graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  // rejected-interval-divisor-counter-spec-v1 s7: DIAG 4 goes from SIX lines to
+  // SEVEN. Drr and Drj sit ABOVE Dm deliberately so Dm remains the LAST line,
+  // which is where the capture sequence's reader has learned to find it. A
+  // DEFINED Drr or Drj of 0 is a REAL ZERO and is a finding -- no interval
+  // rejected by that gate was divisible by 10.
+  if (s_session_start == 0) {
+    snprintf(line, sizeof(line), "Drr --  Drj --");
+  } else {
+    snprintf(line, sizeof(line), "Drr %lu  Drj %lu",
+      (unsigned long)s_drr, (unsigned long)s_drj);
+  }
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
   if (s_session_start == 0 || s_dm == DM_SENTINEL) {
     snprintf(line, sizeof(line), "Dm --");
   } else {
@@ -2006,6 +2060,47 @@ static void prv_draw_diag5(Layer *layer, GContext *ctx) {
   }
   graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+}
+// residue-histogram-spec-v1 s5: DIAG 6 and DIAG 7, FIVE value lines each, two
+// values per line. Twenty values at two per line is ten lines against a
+// nine-line ceiling, so TWO screens is forced, not chosen. The font is NOT
+// shrunk and no value is dropped. Header 28px from y=2 then 5 x 18px leaves y
+// at 120; DIAG 2 renders nine lines to y=190, verified on the watch
+// 2026-08-20, so 120 is 70px inside a proven height. The undefined guard keys
+// on s_session_start; zero prints -- and NEVER 0 per
+// undefined-value-display-rule-2026-08-27 s3.1 case 2 -- NOT
+// measurement-spec-v1 s3.5, which governs the persistence case only (that
+// file's s7). A DEFINED Rj of 0 is a REAL ZERO and is a finding (s3.2).
+static void prv_draw_residues(Layer *layer, GContext *ctx,
+                              const char *title, uint8_t first) {
+  GRect b = layer_get_bounds(layer);
+  graphics_context_set_text_color(ctx, GColorBlack);
+  char line[64];
+  int y = 2;
+  GFont f = fonts_get_system_font(FONT_KEY_GOTHIC_14);
+  snprintf(line, sizeof(line), "%s", title);
+  graphics_draw_text(ctx, line, fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
+    GRect(4, y, b.size.w - 8, 28), GTextOverflowModeTrailingEllipsis,
+    GTextAlignmentLeft, NULL); y += 28;
+  for (uint8_t k = 0; k < 5; k++) {
+    uint8_t a = (uint8_t)(first + 2 * k);
+    if (s_session_start == 0) {
+      snprintf(line, sizeof(line), "R%u --  R%u --",
+        (unsigned)a, (unsigned)(a + 1));
+    } else {
+      snprintf(line, sizeof(line), "R%u %lu  R%u %lu",
+        (unsigned)a, (unsigned long)s_res[a],
+        (unsigned)(a + 1), (unsigned long)s_res[a + 1]);
+    }
+    graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  }
+}
+static void prv_draw_diag6(Layer *layer, GContext *ctx) {
+  prv_draw_residues(layer, ctx, "Diag 6", 0);
+}
+static void prv_draw_diag7(Layer *layer, GContext *ctx) {
+  prv_draw_residues(layer, ctx, "Diag 7", 10);
 }
 static void prv_compute_runs(RunStats *st) {
   memset(st, 0, sizeof(*st));
@@ -2227,6 +2322,8 @@ static void prv_canvas_update(Layer *layer, GContext *ctx) {
     case MODE_DIAG3:     prv_draw_diag3(layer, ctx);     break;
     case MODE_DIAG4:     prv_draw_diag4(layer, ctx);     break;
     case MODE_DIAG5:     prv_draw_diag5(layer, ctx);     break;
+    case MODE_DIAG6:     prv_draw_diag6(layer, ctx);     break;
+    case MODE_DIAG7:     prv_draw_diag7(layer, ctx);     break;
     case MODE_RUNS:      prv_draw_runs(layer, ctx);      break;
     case MODE_HISTORY:   prv_draw_history(layer, ctx);   break;
     case MODE_IDLE:
@@ -2357,6 +2454,30 @@ static void prv_diag5_to_diag4(ClickRecognizerRef r, void *ctx) {
   window_set_click_config_provider(s_window, prv_click_config);
   layer_mark_dirty(s_canvas);
 }
+// residue-histogram-spec-v1 s6: DIAG 5 gains a DOWN handler -- it had none, it
+// terminated the chain. DIAG 7 now terminates it and has no DOWN. This repeats
+// the existing DIAG-to-DIAG idiom and adds no new one. DIAG 5's SELECT handler
+// is NOT touched, NOT rewired and NOT guarded further.
+static void prv_diag5_to_diag6(ClickRecognizerRef r, void *ctx) {
+  s_mode = MODE_DIAG6;
+  window_set_click_config_provider(s_window, prv_click_config);
+  layer_mark_dirty(s_canvas);
+}
+static void prv_diag6_to_diag5(ClickRecognizerRef r, void *ctx) {
+  s_mode = MODE_DIAG5;
+  window_set_click_config_provider(s_window, prv_click_config);
+  layer_mark_dirty(s_canvas);
+}
+static void prv_diag6_to_diag7(ClickRecognizerRef r, void *ctx) {
+  s_mode = MODE_DIAG7;
+  window_set_click_config_provider(s_window, prv_click_config);
+  layer_mark_dirty(s_canvas);
+}
+static void prv_diag7_to_diag6(ClickRecognizerRef r, void *ctx) {
+  s_mode = MODE_DIAG6;
+  window_set_click_config_provider(s_window, prv_click_config);
+  layer_mark_dirty(s_canvas);
+}
 // s5: THE ONE HARD GUARD. A multi-hundred-millisecond CPU burst during a night
 // perturbs the very thing every other instrument is measuring, and the capture
 // sequence walks the DIAG screens AT STOP while the session statics are live.
@@ -2427,7 +2548,17 @@ static void prv_click_config(void *ctx) {
     case MODE_DIAG5:
       window_single_click_subscribe(BUTTON_ID_UP, prv_diag5_to_diag4);
       window_single_click_subscribe(BUTTON_ID_SELECT, prv_diag5_select);
+      window_single_click_subscribe(BUTTON_ID_DOWN, prv_diag5_to_diag6);
       window_single_click_subscribe(BUTTON_ID_BACK, prv_diag5_to_diag4);
+      break;
+    case MODE_DIAG6:
+      window_single_click_subscribe(BUTTON_ID_UP, prv_diag6_to_diag5);
+      window_single_click_subscribe(BUTTON_ID_DOWN, prv_diag6_to_diag7);
+      window_single_click_subscribe(BUTTON_ID_BACK, prv_diag6_to_diag5);
+      break;
+    case MODE_DIAG7:
+      window_single_click_subscribe(BUTTON_ID_UP, prv_diag7_to_diag6);
+      window_single_click_subscribe(BUTTON_ID_BACK, prv_diag7_to_diag6);
       break;
     case MODE_RUNS:
       window_single_click_subscribe(BUTTON_ID_UP, prv_runs_to_idle);
