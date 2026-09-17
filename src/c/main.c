@@ -288,7 +288,6 @@ static uint16_t s_night_hr_count = 0;
 static uint16_t s_mins[4] = {0, 0, 0, 0};
 static uint8_t s_awake_streak = 0;
 static SleepStage s_last_stage = StageLight;
-static AppTimer *s_ui_timer = NULL;
 typedef enum { MODE_IDLE, MODE_RECORDING, MODE_RESULTS, MODE_HYPNO, MODE_HISTORY, MODE_DIAG, MODE_DIAG2, MODE_DIAG3, MODE_DIAG4, MODE_DIAG5, MODE_DIAG6, MODE_DIAG7, MODE_RUNS } ScreenMode;
 
 // onwatch-timing-readout-spec-v1 s4: the timing instrument. NOT session-scoped
@@ -563,13 +562,6 @@ static void prv_health_handler(HealthEventType event, void *context) {
     }
   }
   if (s_mode == MODE_IDLE) layer_mark_dirty(s_canvas);
-}
-
-static void prv_ui_tick(void *data) {
-  s_ui_timer = NULL;
-  if (!s_recording) return;
-  layer_mark_dirty(s_canvas);
-  s_ui_timer = app_timer_register(1000, prv_ui_tick, NULL);
 }
 
 static void prv_start_recording(void) {
