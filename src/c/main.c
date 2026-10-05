@@ -955,7 +955,15 @@ static void prv_awake_redecide(void) {
     bool c2 = (a_hr_m > 0) && (s_epoch_hf[i] > 0) &&
               ((uint32_t)s_epoch_hf[i] * 100 > (uint32_t)a_hr_m * 103);
 
-    SleepStage ns_stage = (c1 || c2) ? StageAwake : StageLight;
+    // awake-stillness-gate-spec-v1 s1/s2: a post-onset c2 minute inside a
+    // stillness run of >= STILL_RUN_MIN does NOT contribute to Awake. c2_eff
+    // feeds the STAGE DECISION ONLY; the ungated c2 still feeds every
+    // instrument below (s3). s_epoch_in_run is built at the top of this
+    // function before this loop. classifier_series 15.
+    bool c2_in_run = (s_epoch_in_run[i >> 3] & (uint8_t)(1 << (i & 7))) != 0;
+    bool c2_eff = c2 && !c2_in_run;
+
+    SleepStage ns_stage = (c1 || c2_eff) ? StageAwake : StageLight;
     // awake-clause-counters-spec-v1 s2: counted from the SAME booleans the
     // decision uses, and BEFORE any continue below, so no Awake minute at or
     // after onset can be skipped. s2: pre-onset minutes are counted in
@@ -991,7 +999,7 @@ static void prv_awake_redecide(void) {
     }
     // Clearing goes to Light so the minute becomes eligible for step 5's
     // Light/REM decision, which skips StageAwake (bae23c3 s2, unchanged).
-    if (!(c1 || c2) && rec.stage != (uint8_t)StageAwake) continue;
+    if (!(c1 || c2_eff) && rec.stage != (uint8_t)StageAwake) continue;
     if ((uint8_t)ns_stage == rec.stage) continue;
     // stage-counter-atomicity-fix-2026-08-24 s3: the move happens in full or
     // not at all. The decrement was guarded and the increment was not, so a
