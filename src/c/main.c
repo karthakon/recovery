@@ -256,6 +256,11 @@ static uint16_t s_mv_n = 0;
 // bridged across minutes carrying no evidence is not a run.
 // s_epoch_in_run marks minutes sitting inside a run of >= STILL_RUN_MIN.
 static uint8_t s_epoch_in_run[(EPOCH_VAR_MAX + 7) / 8];
+// epoch-position-readout-spec-v1 s5: minutes c2 claimed that the stillness
+// gate removed from the stage decision (c2 && c2_in_run). RAM-only, written
+// at ONE site -- beside s_c2_still++ -- so its set-bit count IS C2s by
+// construction. Read by the Pos G render and by NOTHING else.
+static uint8_t s_epoch_c2g[(EPOCH_VAR_MAX + 7) / 8];
 static uint16_t s_sr_p50 = 0;
 static uint16_t s_sr_p90 = 0;
 static uint16_t s_sr_max = 0;
@@ -288,7 +293,7 @@ static uint16_t s_night_hr_count = 0;
 static uint16_t s_mins[4] = {0, 0, 0, 0};
 static uint8_t s_awake_streak = 0;
 static SleepStage s_last_stage = StageLight;
-typedef enum { MODE_IDLE, MODE_RECORDING, MODE_RESULTS, MODE_HYPNO, MODE_HISTORY, MODE_DIAG, MODE_DIAG2, MODE_DIAG3, MODE_DIAG4, MODE_DIAG5, MODE_DIAG6, MODE_DIAG7, MODE_RUNS } ScreenMode;
+typedef enum { MODE_IDLE, MODE_RECORDING, MODE_RESULTS, MODE_HYPNO, MODE_HISTORY, MODE_DIAG, MODE_DIAG2, MODE_DIAG3, MODE_DIAG4, MODE_DIAG5, MODE_DIAG6, MODE_DIAG7, MODE_RUNS, MODE_POS } ScreenMode;
 
 // onwatch-timing-readout-spec-v1 s4: the timing instrument. NOT session-scoped
 // and NOT gated on s_recording -- it is an on-demand synthetic benchmark and
@@ -578,6 +583,7 @@ static void prv_start_recording(void) {
   s_moved_min = 0;                                   // mv-gate-spec-v1 s2
   s_mv_p50 = s_mv_p90 = s_mv_p99 = s_mv_max = s_mv_n = 0;
   memset(s_epoch_in_run, 0, sizeof(s_epoch_in_run));  // still-run-spec-v1 s2
+  memset(s_epoch_c2g, 0, sizeof(s_epoch_c2g));        // epoch-position-readout-spec-v1 s5
   s_sr_p50 = s_sr_p90 = s_sr_max = s_sr_n = s_sr_long = 0;
   s_c2_still = s_c2_total = 0;                        // still-run-spec-v1 s4
   s_he = s_hx = s_hn = s_hd = 0;                     // hrv-cadence-spec-v1 s3
@@ -981,7 +987,10 @@ static void prv_awake_redecide(void) {
     // registered against them until they have read once (s9).
     if (c2 && s_onset_epoch_idx >= 0 && i >= (uint16_t)s_onset_epoch_idx) {
       s_c2_total++;
-      if ((s_epoch_in_run[i >> 3] & (uint8_t)(1 << (i & 7))) != 0) s_c2_still++;
+      if ((s_epoch_in_run[i >> 3] & (uint8_t)(1 << (i & 7))) != 0) {
+        s_c2_still++;
+        s_epoch_c2g[i >> 3] |= (uint8_t)(1 << (i & 7));   // epoch-position-readout-spec-v1 s5
+      }
     }
     if (s_onset_epoch_idx >= 0 && i >= (uint16_t)s_onset_epoch_idx) {
       if (c2) s_ab_l++;
@@ -2312,6 +2321,123 @@ static void prv_draw_runs(Layer *layer, GContext *ctx) {
     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 }
 
+// epoch-position-readout-spec-v1 s4/s6. Four series, each rendered as its
+// maximal runs of consecutive epoch indices, start+length, ascending.
+// G = c2 && c2_in_run (RAM bitmap, live only); A = reserved Awake (pre-smoother);
+// W = stage Awake (post-smoother); R = stage REM && reserved != REM (promoted).
+// A/W/R read stored epochs with storage_epoch_read ONLY, never _update. A
+// failed read BREAKS a run and is counted in rf; no epoch is fabricated (s6).
+// 24 and 3 are layout counts read by no decision (s11).
+#define POS_PER_LINE 3
+#define POS_LINES 8
+#define POS_PER_PAGE (POS_PER_LINE * POS_LINES)
+enum { POS_G = 0, POS_A = 1, POS_W = 2, POS_R = 3, POS_SERIES = 4 };
+typedef struct {
+  bool defined;
+  uint16_t runs, mins, rf, dem;
+  uint8_t k;                          // items collected for the requested page
+  uint16_t st[POS_PER_PAGE], ln[POS_PER_PAGE];
+} PosPage;
+static uint8_t s_pos_series = POS_G;
+static uint16_t s_pos_page = 0;       // 0-based page within the series
+
+static void prv_pos_emit(PosPage *pg, uint16_t page, uint16_t start, uint16_t len) {
+  uint16_t idx = pg->runs;            // 0-based index of this run
+  pg->runs++;
+  pg->mins += len;
+  if (idx / POS_PER_PAGE == page && pg->k < POS_PER_PAGE) {
+    pg->st[pg->k] = start;
+    pg->ln[pg->k] = len;
+    pg->k++;
+  }
+}
+
+static void prv_pos_collect(uint8_t series, uint16_t page, PosPage *pg) {
+  memset(pg, 0, sizeof(*pg));
+  uint16_t run_start = 0, run_len = 0;
+  if (series == POS_G) {
+    if (s_session_start == 0) return;   // undefined-value rule s3.1 case 2
+    pg->defined = true;
+    uint16_t n = s_epoch_var_count;
+    for (uint16_t i = 0; i <= n; i++) {
+      bool in = (i < n) && ((s_epoch_c2g[i >> 3] & (uint8_t)(1 << (i & 7))) != 0);
+      if (in) { if (run_len == 0) run_start = i; run_len++; }
+      else if (run_len > 0) { prv_pos_emit(pg, page, run_start, run_len); run_len = 0; }
+    }
+    return;
+  }
+  uint16_t n = storage_epoch_count();
+  if (n == 0) return;
+  pg->defined = true;
+  for (uint16_t t = 0; t <= n; t++) {
+    bool in = false;
+    if (t < n) {
+      EpochRecord rec;
+      if (!storage_epoch_read(t, &rec)) {
+        pg->rf++;                        // s6: breaks the run, nothing fabricated
+      } else if (series == POS_A) {
+        in = (rec.reserved == (uint8_t)StageAwake);
+      } else if (series == POS_W) {
+        in = (rec.stage == (uint8_t)StageAwake);
+      } else {
+        in = (rec.stage == (uint8_t)StageREM && rec.reserved != (uint8_t)StageREM);
+        if (rec.reserved == (uint8_t)StageREM && rec.stage != (uint8_t)StageREM) pg->dem++;
+      }
+    }
+    if (in) { if (run_len == 0) run_start = t; run_len++; }
+    else if (run_len > 0) { prv_pos_emit(pg, page, run_start, run_len); run_len = 0; }
+  }
+}
+
+static uint16_t prv_pos_pages(const PosPage *pg) {
+  if (!pg->defined || pg->runs == 0) return 1;
+  return (uint16_t)((pg->runs + POS_PER_PAGE - 1) / POS_PER_PAGE);
+}
+
+static void prv_draw_pos(Layer *layer, GContext *ctx) {
+  static const char *const titles[POS_SERIES] = { "Pos G", "Pos A", "Pos W", "Pos R" };
+  GRect b = layer_get_bounds(layer);
+  graphics_context_set_text_color(ctx, GColorBlack);
+  char line[64];
+  int y = 2;
+  GFont f = fonts_get_system_font(FONT_KEY_GOTHIC_14);
+  static PosPage pg;                   // file-scope storage, off the stack
+  prv_pos_collect(s_pos_series, s_pos_page, &pg);
+  graphics_draw_text(ctx, titles[s_pos_series],
+    fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
+    GRect(4, y, b.size.w - 8, 26), GTextOverflowModeTrailingEllipsis,
+    GTextAlignmentLeft, NULL); y += 26;
+  // s6: undefined prints -- and NEVER 0; a defined n 0 m 0 is a REAL ZERO.
+  if (!pg.defined) {
+    snprintf(line, sizeof(line), "n --  m --");
+  } else {
+    unsigned p = (unsigned)s_pos_page + 1, pn = (unsigned)prv_pos_pages(&pg);
+    if (s_pos_series == POS_G) {
+      snprintf(line, sizeof(line), "n %u  m %u  p %u/%u",
+        (unsigned)pg.runs, (unsigned)pg.mins, p, pn);
+    } else if (s_pos_series == POS_R) {
+      snprintf(line, sizeof(line), "n %u  m %u  dem %u  p %u/%u",
+        (unsigned)pg.runs, (unsigned)pg.mins, (unsigned)pg.dem, p, pn);
+    } else {
+      snprintf(line, sizeof(line), "n %u  m %u  rf %u  p %u/%u",
+        (unsigned)pg.runs, (unsigned)pg.mins, (unsigned)pg.rf, p, pn);
+    }
+  }
+  graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+    GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  for (uint8_t j = 0; j < pg.k; j += POS_PER_LINE) {
+    int o = 0;
+    line[0] = '\0';
+    for (uint8_t q = j; q < pg.k && q < j + POS_PER_LINE; q++) {
+      o += snprintf(line + o, sizeof(line) - (size_t)o, (q == j) ? "%u+%u" : "  %u+%u",
+                    (unsigned)pg.st[q], (unsigned)pg.ln[q]);
+      if (o >= (int)sizeof(line)) break;
+    }
+    graphics_draw_text(ctx, line, f, GRect(4, y, b.size.w - 8, 18),
+      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL); y += 18;
+  }
+}
+
 static void prv_canvas_update(Layer *layer, GContext *ctx) {
   switch (s_mode) {
     case MODE_RECORDING: prv_draw_recording(layer, ctx); break;
@@ -2325,6 +2451,7 @@ static void prv_canvas_update(Layer *layer, GContext *ctx) {
     case MODE_DIAG6:     prv_draw_diag6(layer, ctx);     break;
     case MODE_DIAG7:     prv_draw_diag7(layer, ctx);     break;
     case MODE_RUNS:      prv_draw_runs(layer, ctx);      break;
+    case MODE_POS:       prv_draw_pos(layer, ctx);       break;   // epoch-position-readout-spec-v1
     case MODE_HISTORY:   prv_draw_history(layer, ctx);   break;
     case MODE_IDLE:
     default:             prv_draw_idle(layer, ctx);      break;
@@ -2502,6 +2629,48 @@ static void prv_runs_to_idle(ClickRecognizerRef r, void *ctx) {
   window_set_click_config_provider(s_window, prv_click_config);
   layer_mark_dirty(s_canvas);
 }
+// epoch-position-readout-spec-v1 s6: RUNS DOWN enters Pos G page 1. On a Pos
+// page DOWN steps to the next page in the fixed order G, A, W, R (no-op on the
+// last page); UP steps back (to RUNS from Pos G page 1); BACK returns to RUNS.
+static uint16_t prv_pos_page_count(uint8_t series) {
+  static PosPage tmp;
+  prv_pos_collect(series, 0, &tmp);
+  return prv_pos_pages(&tmp);
+}
+static void prv_runs_to_pos(ClickRecognizerRef r, void *ctx) {
+  s_pos_series = POS_G;
+  s_pos_page = 0;
+  s_mode = MODE_POS;
+  window_set_click_config_provider(s_window, prv_click_config);
+  layer_mark_dirty(s_canvas);
+}
+static void prv_pos_to_runs(ClickRecognizerRef r, void *ctx) {
+  s_mode = MODE_RUNS;
+  window_set_click_config_provider(s_window, prv_click_config);
+  layer_mark_dirty(s_canvas);
+}
+static void prv_pos_next(ClickRecognizerRef r, void *ctx) {
+  if (s_pos_page + 1 < prv_pos_page_count(s_pos_series)) {
+    s_pos_page++;
+  } else if (s_pos_series + 1 < POS_SERIES) {
+    s_pos_series++;
+    s_pos_page = 0;
+  }
+  layer_mark_dirty(s_canvas);
+}
+static void prv_pos_prev(ClickRecognizerRef r, void *ctx) {
+  if (s_pos_page > 0) {
+    s_pos_page--;
+  } else if (s_pos_series > POS_G) {
+    s_pos_series--;
+    uint16_t pc = prv_pos_page_count(s_pos_series);
+    s_pos_page = (uint16_t)(pc - 1);
+  } else {
+    prv_pos_to_runs(r, ctx);
+    return;
+  }
+  layer_mark_dirty(s_canvas);
+}
 static void prv_click_config(void *ctx) {
   switch (s_mode) {
     case MODE_IDLE:
@@ -2562,7 +2731,13 @@ static void prv_click_config(void *ctx) {
       break;
     case MODE_RUNS:
       window_single_click_subscribe(BUTTON_ID_UP, prv_runs_to_idle);
+      window_single_click_subscribe(BUTTON_ID_DOWN, prv_runs_to_pos);   // epoch-position s6
       window_single_click_subscribe(BUTTON_ID_BACK, prv_runs_to_idle);
+      break;
+    case MODE_POS:
+      window_single_click_subscribe(BUTTON_ID_UP, prv_pos_prev);
+      window_single_click_subscribe(BUTTON_ID_DOWN, prv_pos_next);
+      window_single_click_subscribe(BUTTON_ID_BACK, prv_pos_to_runs);
       break;
     case MODE_HISTORY:
       window_single_click_subscribe(BUTTON_ID_UP, prv_hist_older);
